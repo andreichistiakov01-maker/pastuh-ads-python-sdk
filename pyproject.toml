@@ -1,0 +1,46 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "pastuh-ads"
+version = "1.2.2"
+description = "Async Python SDK for Pastuh Ads Partner API: op-list, interactive OP block, clicks, bot-start, Premium/gender observation"
+readme = "README.md"
+requires-python = ">=3.10"
+license = { text = "Proprietary" }
+authors = [{ name = "Pastuh Ads" }]
+keywords = ["telegram", "advertising", "partner-api", "op-block"]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: Developers",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Operating System :: OS Independent",
+]
+dependencies = ["httpx>=0.27,<1.0"]
+
+[project.optional-dependencies]
+aiogram = ["aiogram>=3.0,<4.0"]
+dev = ["pytest>=8.0", "pytest-asyncio>=0.23", "respx>=0.21", "aiogram>=3.0,<4.0"]
+
+[project.urls]
+Homepage = "https://github.com/andreichistiakov01-maker/pastuh-ads-python-sdk"
+Issues = "https://github.com/andreichistiakov01-maker/pastuh-ads-python-sdk/issues"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/pastuh_ads"]
+
+[tool.hatch.build.targets.sdist]
+include = [
+    "src/pastuh_ads",
+    "README.md",
+    "README_RU.md",
+    "CHANGELOG.md",
+    "docs",
+    "examples",
+    "tests",
+]
