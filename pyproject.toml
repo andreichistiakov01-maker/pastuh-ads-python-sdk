@@ -8,7 +8,6 @@ version = "1.2.2"
 description = "Async Python SDK for Pastuh Ads Partner API: op-list, interactive OP block, clicks, bot-start, Premium/gender observation"
 readme = "README.md"
 requires-python = ">=3.10"
-license = { text = "Proprietary" }
 authors = [{ name = "Pastuh Ads" }]
 keywords = ["telegram", "advertising", "partner-api", "op-block"]
 classifiers = [
