@@ -5,6 +5,8 @@ build-backend = "hatchling.build"
 [project]
 name = "pastuh-ads"
 version = "1.2.2"
+license = "MIT"
+license-files = ["LICENSE"]
 description = "Async Python SDK for Pastuh Ads Partner API: op-list, interactive OP block, clicks, bot-start, Premium/gender observation"
 readme = "README.md"
 requires-python = ">=3.10"
