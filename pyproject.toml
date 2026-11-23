@@ -40,6 +40,7 @@ include = [
     "src/pastuh_ads",
     "README.md",
     "README_RU.md",
+    "LICENSE",
     "CHANGELOG.md",
     "docs",
     "examples",
