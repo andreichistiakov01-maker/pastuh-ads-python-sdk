@@ -197,7 +197,10 @@ async def test_open_sends_single_message_with_buttons(client: PastuhAdsClient, t
     paid = next(b for b in buttons if b["text"] == "Открыть бота")
     assert sub.get("url") == "https://t.me/chan_a" and "callback_data" not in sub
     assert paid.get("callback_data") == "paop:open:12" and "url" not in paid
-    assert buttons[-1]["callback_data"] == "paop:check"
+    # UX v2: кнопки «Проверить» нет — проверка event-driven (server
+    # events → piggyback /check на событиях → bounded reconcile).
+    # paop:check старых клавиатур по-прежнему роутится в handle_callback.
+    assert not any(b.get("callback_data") == "paop:check" for b in buttons)
 
 
 @respx.mock

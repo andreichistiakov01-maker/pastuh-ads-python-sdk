@@ -52,7 +52,7 @@ jobs:
           whl = glob.glob("dist/*.whl")[0]
           names = zipfile.ZipFile(whl).namelist()
           assert any(n.startswith("pastuh_ads/") for n in names), "package missing"
-          assert "pastuh_ads-1.2.2.dist-info/METADATA" in names
+          assert "pastuh_ads-1.3.0.dist-info/METADATA" in names
           print("wheel contents OK:", len(names), "files")
           PY
 

@@ -41,7 +41,23 @@ Callback-data формат (принадлежит боту партнёра, Н
                                bot_click): серверный transition через API.
     ``paop:reopen:{task_id}``  — повторное открытие оплаченного
                                destination: слот без финансового вызова.
-    ``paop:check``             — «Проверить выполнение»: POST /check.
+    ``paop:check``             — ручной «Проверить» из СТАРЫХ клавиатур
+                               (SDK < следующего релиза): роутинг
+                               сохранён для совместимости, в новой
+                               клавиатуре кнопки нет — проверка
+                               event-driven.
+
+Event-driven (UX-контракт v2): кнопки «Проверить» нет. Подтверждение
+заданий выполняет сервер (chat_member / chat_join_request /
+BotStartEvent / presence-проба), а блок узнаёт об этом двумя путями:
+
+- piggyback на наблюдаемых событиях пользователя: повторный ``open()``
+  и любой ``paop:*`` callback вызывают ``POST /check`` не чаще, чем раз
+  в ``check_min_interval_seconds`` (default 20) — подписка, случившаяся
+  между событиями, подтягивается без ручной кнопки;
+- опциональный bounded fallback ``reconcile_interval_seconds`` —
+  мягкий ``GET /status`` цикл до expiry/240 итераций (по умолчанию
+  выключен).
 """
 
 from __future__ import annotations
@@ -49,6 +65,7 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import logging
+import time
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from typing import Any, Awaitable, Callable
@@ -79,7 +96,6 @@ _REOPENABLE_ACTIONS = _PAID_CALLBACK_ACTIONS
 
 _MAIN_TEXT = "Чтобы продолжить, подпишитесь на ресурсы."
 _COMPLETED_TEXT = "🎉 Все задания выполнены. Доступ открыт!"
-_CHECK_ALL_TEXT = "✅ Проверить выполнение"
 _SLOT_TEXT_FALLBACK = "Нажмите кнопку ниже, чтобы перейти:"
 _SLOT_BUTTON_TEXT = "Перейти"
 _MAX_BUTTON_TEXT = 64  # лимит подписи inline-кнопки Telegram, байт
@@ -123,6 +139,7 @@ class _BlockState:
     slot_ref: tuple[int, int] | None = None  # (chat_id, message_id)
     shown_marked: bool = False
     render_failures: int = 0
+    last_check_mono: float = 0.0  # piggyback /check throttle (monotonic)
     lock: asyncio.Lock = field(default_factory=asyncio.Lock)
     slot_task: asyncio.Task | None = None
     reconcile_task: asyncio.Task | None = None
@@ -154,6 +171,9 @@ class InteractiveOpBlock:
         reconcile_interval_seconds: опциональный мягкий фон-refresh через
             ``get_session_status`` (по умолчанию None = выключен). Это НЕ
             массовый polling — задача живёт только пока активна сессия.
+        check_min_interval_seconds: минимальный интервал между piggyback
+            ``POST /check`` на наблюдаемых событиях пользователя
+            (default 20). 0 — piggyback-проверки выключены.
         on_error: опциональный hook ``(context, exception)`` — для метрик;
             исключения не пробрасываются пользователю API.
     """
@@ -169,6 +189,7 @@ class InteractiveOpBlock:
         slot_ttl_seconds: float = 15.0,
         max_render_retries: int = 3,
         reconcile_interval_seconds: float | None = None,
+        check_min_interval_seconds: float = 20.0,
         on_error: ErrorHook | None = None,
     ) -> None:
         self._client = client
@@ -179,6 +200,7 @@ class InteractiveOpBlock:
         self._slot_ttl = max(0.05, float(slot_ttl_seconds))
         self._max_render_retries = max(0, int(max_render_retries))
         self._reconcile_interval = reconcile_interval_seconds
+        self._check_min_interval = max(0.0, float(check_min_interval_seconds))
         self._on_error = on_error
         # Ключ состояния — telegram_user_id: одна живая OP-сессия на
         # пользователя у партнёра (сервер переиспользует открытую).
@@ -266,6 +288,9 @@ class InteractiveOpBlock:
         else:
             # Повторный /start той же сессии: не плодим сообщения —
             # обновляем текущее (и доотправляем /shown, если ранее сорвался).
+            # Событие пользователя: throttled /check подтягивает уже
+            # случившееся подтверждение (подписка между событиями).
+            await self._maybe_check(state)
             await self._render(state)
 
         if self._reconcile_interval is not None:
@@ -309,6 +334,12 @@ class InteractiveOpBlock:
         if data == CB_CHECK:
             await self._handle_check(state, answer)
             return True
+
+        # Любой paop-callback — наблюдаемое событие пользователя:
+        # throttled /check до dispatch (подтверждённые сервером задания
+        # подтягиваются без кнопки «Проверить»). paop:check обработан
+        # выше — он сам и есть проверка.
+        await self._maybe_check(state)
 
         for prefix, handler in ((CB_OPEN, self._handle_open), (CB_REOPEN, self._handle_reopen)):
             if data.startswith(prefix):
@@ -402,8 +433,14 @@ class InteractiveOpBlock:
         state: _BlockState,
         answer: AnswerCallback | None,
     ) -> None:
-        """«Проверить выполнение»: серверная проверка + пересборка."""
+        """Ручной «Проверить» из СТАРОЙ клавиатуры (compat).
+
+        В новых клавиатурах кнопки нет, но callback всё ещё может прийти
+        с клавиатур, отрендеренных прежними версиями — контракт
+        сохраняем: серверная проверка + пересборка.
+        """
         await _answer(answer, "Проверяем выполнение…")
+        state.last_check_mono = time.monotonic()
         try:
             await self._sync_status(state, trigger_check=True)
         except PastuhAdsError as exc:
@@ -425,6 +462,25 @@ class InteractiveOpBlock:
         else:
             status = await self._client.get_session_status(state.op_session_id)
         self._merge_status(state, status)
+
+    async def _maybe_check(self, state: _BlockState) -> None:
+        """Throttled ``POST /check`` на наблюдаемом событии пользователя.
+
+        Не чаще ``check_min_interval_seconds`` на блок, только для живой
+        незавершённой сессии. Ошибки — в ``_report``: событие пользователя
+        не падает из-за фоновой проверки. Рендер — на вызывающей стороне.
+        """
+        if self._check_min_interval <= 0 or state.completed:
+            return
+        now = time.monotonic()
+        if state.last_check_mono > 0 and now - state.last_check_mono < self._check_min_interval:
+            return
+        state.last_check_mono = now
+        try:
+            await self._sync_status(state, trigger_check=True)
+        except Exception as exc:  # noqa: BLE001 — фоновая проба не
+            # должна ронять пользовательское событие ни при каком сбое.
+            self._report("maybe_check", exc)
 
     def _merge_status(self, state: _BlockState, status: SessionStatusResponse) -> None:
         state.expires_at = _parse_dt(status.expires_at) or state.expires_at
@@ -490,7 +546,10 @@ class InteractiveOpBlock:
                 rows.append([button])
 
         rows.extend(self._reopen_rows(state, ordered))
-        rows.append([{"text": _CHECK_ALL_TEXT, "callback_data": CB_CHECK}])
+        # UX-контракт v2: кнопки «Проверить выполнение» нет — проверка
+        # event-driven (server events → /check piggyback на событиях
+        # пользователя → опциональный reconcile-цикл). paop:check из
+        # старых клавиатур по-прежнему роутится в handle_callback.
         return _MAIN_TEXT, rows
 
     def _task_button(self, task: OpTask) -> dict[str, str] | None:

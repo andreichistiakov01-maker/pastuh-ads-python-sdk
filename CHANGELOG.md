@@ -1,5 +1,32 @@
 # Changelog — Pastuh Ads Partner SDK
 
+## 1.3.0
+
+### Добавлено
+
+- **Interactive OP V2 (event-driven, UX-контракт v2)**: кнопки
+  «Проверить выполнение» в новой клавиатуре нет. Подтверждение заданий
+  выполняет сервер (chat_member / chat_join_request / BotStartEvent /
+  presence-проба), блок узнаёт об этом:
+  - piggyback: повторный `open()` и любой `paop:*` callback вызывают
+    throttled `POST /check` (не чаще `check_min_interval_seconds`,
+    default 20с);
+  - опциональный bounded fallback `reconcile_interval_seconds` —
+    мягкий `GET /status` цикл до expiry/240 итераций (OFF по умолчанию).
+- `paop:check` из старых клавиатур по-прежнему роутится в `/check`
+  (compat) — удалять обработчик нельзя.
+- `examples/aiohttp_interactive_op.py` обновлён до UX v2: gender
+  `user_observation` (env `PASTUH_ADS_GENDER_CLAIM=off|sdk|male|female|
+  unknown`), JSON-persistence `PASTUH_ADS_STATE_PATH` (atomic write,
+  chmod 600), bounded fallback [60с, 240с].
+
+### Совместимость
+
+Публичные сигнатуры без breaking changes: `open()`/`handle_callback()`/
+`dump_state`/`restore_state`/`resume` — прежние. Новый параметр
+`check_min_interval_seconds` имеет default. Обработчик `paop:check`
+обязателен для старых сообщений.
+
 ## 1.2.2
 
 ### Изменено
