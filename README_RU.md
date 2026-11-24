@@ -268,7 +268,14 @@ handled = await block.handle_callback(
 | `subscription_confirmed` / `join_request_submitted` / `bot_start_confirmed` / `bot_new_user_verified` | прямой `url` (one-tap t.me) |
 | `bot_tracked_click` / `bot_click` | `paop:open:<task_id>` → серверный transition → TTL-слот |
 | выполненный paid-click | `paop:reopen:<task_id>` — слот без финансового вызова |
-| `paop:check` | «✅ Проверить выполнение» → `POST /check` |
+| `paop:check` | legacy-клавиатуры SDK <1.3: «✅ Проверить выполнение» → `POST /check` (роутинг сохранён; в новой клавиатуре кнопки нет) |
+
+**Event-driven проверка (UX v2, SDK ≥1.3)**: кнопки «Проверить» в новой
+клавиатуре нет — подтверждение заданий делает сервер. Блок подтягивает
+результат throttled `POST /check` на наблюдаемых событиях пользователя
+(`open()`, любой `paop:*` callback; не чаще `check_min_interval_seconds`,
+default 20с) и опциональным bounded fallback-циклом
+`reconcile_interval_seconds` (до expiry/240 итераций, по умолчанию OFF).
 
 - **Negotiation**: `block.open()` сам передаёт
   `capabilities=['callback_cta','interactive_op']`. Если сервер не

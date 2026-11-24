@@ -12,7 +12,9 @@ tokenless destination живёт во временном слоте (~15с) и �
      TTL-слот с прямой ссылкой → кнопка уходит, остаётся reopen-CTA.
   4. paop:reopen:<task_id> — повторное открытие оплаченного слота
      БЕЗ нового финансового вызова (ноль запросов к Partner API).
-  5. paop:check — «Проверить выполнение» → POST /check → пересборка.
+  5. paop:check — legacy-кнопка «Проверить» из старых клавиатур (SDK <1.3)
+     → POST /check → пересборка. В новых клавиатурах кнопки нет: проверка
+     event-driven (throttled /check на событиях + bounded fallback).
   6. dump_state/restore_state/resume — пережитие рестарта процесса.
 
 Установка: pip install "pastuh-ads[aiogram]" (или aiogram>=3.0 + httpx)

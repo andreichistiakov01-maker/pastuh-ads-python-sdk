@@ -90,7 +90,7 @@ Callback-data бота:
 |---|---|
 | `paop:open:{task_id}` | Оплачиваемый клик → серверная фиксация → TTL-слот |
 | `paop:reopen:{task_id}` | Повторное открытие оплаченного слота (без API) |
-| `paop:check` | «Проверить выполнение» → POST /check → пересборка |
+| `paop:check` | legacy-клавиатуры SDK <1.3 → POST /check (в новой кнопки нет — проверка event-driven: throttled /check на событиях пользователя + bounded fallback) |
 
 Готовый пример: [examples/aiogram3_interactive_op.py](examples/aiogram3_interactive_op.py).
 Без aiogram/SDK — голый aiohttp: [examples/aiohttp_interactive_op.py](examples/aiohttp_interactive_op.py).
