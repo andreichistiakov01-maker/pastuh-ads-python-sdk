@@ -679,7 +679,10 @@ async def test_new_session_sends_fresh_block_not_stale_edit(client: PastuhAdsCli
 
     assert mid2 != mid1
     assert len(tg.sent) == 2                      # новое сообщение, а не edit
-    assert not tg.edits and not tg.text_edits     # сообщение сессии 77 не тронуто
+    # Вытесненное сообщение сессии 77: клавиатура СНЯТА (пустой markup) —
+    # осиротевшие CTA («Запустить бота») не остаются активными вечно.
+    assert tg.edits == [(CHAT, mid1, [])]
+    assert not tg.text_edits
     assert shown88.called
     state = block._states[UID]
     assert state.op_session_id == 88
@@ -708,7 +711,10 @@ async def test_restored_state_with_new_session_sends_fresh(client: PastuhAdsClie
     await client.aclose()
 
     assert mid != 4242
-    assert not tg.edits and not tg.text_edits     # чужое сообщение не тронуто
+    # Вытесненное восстановленное сообщение: клавиатура снята (пустой markup),
+    # контент не редактируется — осиротевших CTA нет.
+    assert tg.edits == [(CHAT, 4242, [])]
+    assert not tg.text_edits
     assert shown.called
     assert tg.sent[-1][2] == "Чтобы продолжить, подпишитесь на ресурсы."
 
@@ -791,3 +797,69 @@ async def test_send_failure_propagates_without_shown(client: PastuhAdsClient, tg
     await client.aclose()
     assert mid is not None
     assert shown.called
+
+
+@respx.mock
+async def test_server_confirmed_task_never_resurrects_via_stale_status(client: PastuhAdsClient, tg: FakeTelegram):
+    """Boom BUG1 regression: задание, подтверждённое СЕРВЕРОМ (не локальной
+    оплатой), не возвращается на клавиатуру, даже если запаздывающий
+    status-ответ (in-flight до серверного confirm) снова перечисляет его
+    в incomplete. server_done_ids — терминальный монотонный фильтр."""
+    _mock_op_and_click()
+    # Ответ 1 (свежий): сервер уже подтвердил — incomplete пуст, access granted.
+    # Ответ 2 (stale, вылетевший до confirm): задание снова incomplete.
+    respx.post(f"{BASE}/op-sessions/77/check").mock(side_effect=[
+        httpx.Response(200, json=_status_payload([
+            _task(12, "bot_tracked_click", url="https://x.test/r/tok",
+                  target_url="https://t.me/paid_bot?start=pa_12",
+                  open_mode="callback", username="paid_bot", status="confirmed"),
+        ], incomplete=[], access=True)),
+        httpx.Response(200, json=_status_payload([
+            _task(12, "bot_tracked_click", url="https://x.test/r/tok",
+                  target_url="https://t.me/paid_bot?start=pa_12",
+                  open_mode="callback", username="paid_bot", status="shown"),
+        ], incomplete=[12], access=False)),
+    ])
+
+    block = make_block(client, tg)
+    await block.open(UID, CHAT)
+    await block.handle_callback(UID, CHAT, "paop:check")   # свежий: complete
+    state = block._states[UID]
+    assert state.completed
+    assert 12 in state.server_done_ids
+
+    await block.handle_callback(UID, CHAT, "paop:check")   # stale incomplete
+    await client.aclose()
+
+    # Задание НЕ воскресло ни в состоянии, ни на клавиатуре.
+    assert 12 not in state.incomplete_ids
+    buttons = tg.flat_buttons()
+    assert not any(b.get("callback_data") == "paop:open:12" for b in buttons)
+
+
+@respx.mock
+async def test_server_done_ids_survive_dump_restore(client: PastuhAdsClient, tg: FakeTelegram):
+    """Restart persistence: server_done_ids входит в dump/restore — после
+    перезапуска процесса воскрешение по-прежнему невозможно."""
+    _mock_op_and_click()
+    respx.post(f"{BASE}/op-sessions/77/check").mock(return_value=httpx.Response(
+        200, json=_status_payload([
+            _task(12, "bot_tracked_click", url="https://x.test/r/tok",
+                  target_url="https://t.me/paid_bot?start=pa_12",
+                  open_mode="callback", username="paid_bot", status="confirmed"),
+        ], incomplete=[], access=True)))
+
+    block = make_block(client, tg)
+    await block.open(UID, CHAT)
+    await block.handle_callback(UID, CHAT, "paop:check")
+    await client.aclose()
+
+    dump = block.dump_state()
+    assert 12 in dump["blocks"][0]["server_done_ids"]
+
+    block2 = make_block(client, tg)
+    block2.restore_state(dump)
+    state = block2._states[UID]
+    assert 12 in state.server_done_ids
+    assert 12 not in state.incomplete_ids
+    await client.aclose()

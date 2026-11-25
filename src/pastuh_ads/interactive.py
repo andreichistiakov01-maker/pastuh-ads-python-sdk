@@ -162,6 +162,10 @@ class _BlockState:
     completed: bool = False
     access_allowed: bool = False
     paid_done_ids: set[int] = field(default_factory=set)
+    # Задания, которые сервер хоть раз вернул завершёнными. Серверный
+    # переход в complete терминален (taskGrantsAccess монотонен), поэтому
+    # повторного появления быть не должно даже при гонке stale-ответов.
+    server_done_ids: set[int] = field(default_factory=set)
     rev: int = 0
     slot_ref: tuple[int, int] | None = None  # (chat_id, message_id)
     shown_marked: bool = False
@@ -269,6 +273,26 @@ class InteractiveOpBlock:
     # Открытие OP-блока
     # ------------------------------------------------------------------
 
+    async def _retire_state(self, state: _BlockState) -> None:
+        """Снять клавиатуру с вытесняемого OP-сообщения (best-effort).
+
+        Сервер выдал новую сессию или пользователь перешёл в другой чат:
+        прежнее сообщение больше не трекается — без очистки его кнопки
+        («Запустить бота» и др.) остались бы активными вечно, хотя слот
+        уже не должен показываться. Идемпотентно: повторное снятие —
+        «message not modified», ошибки только в report. Текст не трогаем:
+        edit_text может быть не подключён партнёром, а пустая клавиатура
+        уже исключает нажатия.
+        """
+        if state.reconcile_task is not None and not state.reconcile_task.done():
+            state.reconcile_task.cancel()
+        if state.message_id is None:
+            return
+        try:
+            await self._edit_markup(state.chat_id, state.message_id, [])
+        except Exception as exc:  # noqa: BLE001 — best-effort cleanup
+            self._report("retire", exc)
+
     async def open(
         self,
         telegram_user_id: int,
@@ -294,12 +318,10 @@ class InteractiveOpBlock:
         self._prune_states()
         state = self._states.get(telegram_user_id)
         if state is not None and state.chat_id != chat_id:
-            # Другой чат — новая сессия. Старый state вытесняется: его
-            # reconcile-цикл отменяем, чтобы устаревшие рендеры не шли
-            # в прежний диалог. Slot-task доживает свой TTL и сам
-            # убирает слот по ref-match guard — трогать его не нужно.
-            if state.reconcile_task is not None and not state.reconcile_task.done():
-                state.reconcile_task.cancel()
+            # Другой чат — новая сессия. Старый state вытесняется: клавиатура
+            # прежнего сообщения снимается (никаких осиротевших CTA),
+            # slot-task доживает свой TTL по ref-match guard.
+            await self._retire_state(state)
             state = None
 
         capabilities = ["callback_cta", "interactive_op"]
@@ -316,13 +338,11 @@ class InteractiveOpBlock:
         )
 
         if state is not None and state.op_session_id != op_list.op_session_id:
-            # Сервер выдал НОВУЮ сессию: сохранённый message_id и флаги
-            # принадлежат блоку ПРЕЖНЕЙ сессии — редактировать его нельзя
-            # (сообщение ушло бы вглубь истории, а /shown новой сессии
-            # никогда бы не отправился). Начинаем с чистого блока;
-            # reconcile старого state отменяем, слот доживает TTL.
-            if state.reconcile_task is not None and not state.reconcile_task.done():
-                state.reconcile_task.cancel()
+            # Сервер выдал НОВУЮ сессию: прежний блок вытесняется. Его
+            # сообщение больше не трекается — клавиатуру снимаем, иначе
+            # осиротевшие кнопки («Запустить бота») остаются активными
+            # после вытеснения. Начинаем с чистого блока; слот доживает TTL.
+            await self._retire_state(state)
             state = None
 
         if state is None:
@@ -570,13 +590,22 @@ class InteractiveOpBlock:
         """
         by_id = {t.task_id: t for t in tasks if t.task_id}
         state.tasks.update(by_id)
+        # Монотонность: задание, присутствующее в ответе, но НЕ в его
+        # incomplete-списке, сервер считает завершённым — фиксируем
+        # терминально. Stale-ответ (in-flight до серверного confirm)
+        # больше не воскрешает кнопку.
+        if incomplete_ids is not None:
+            state.server_done_ids.update(
+                i for i in by_id if i not in incomplete_ids
+            )
+        done = state.paid_done_ids | state.server_done_ids
         if incomplete_ids is None:
             # op-list: все выданные задания незавершённые.
-            state.incomplete_ids = set(by_id) - state.paid_done_ids
+            state.incomplete_ids = set(by_id) - done
         else:
             state.incomplete_ids = {
                 i for i in incomplete_ids
-                if i in state.tasks and i not in state.paid_done_ids
+                if i in state.tasks and i not in done
             }
         state.completed = access_allowed or not state.incomplete_ids
         state.access_allowed = state.access_allowed or access_allowed
@@ -884,6 +913,7 @@ class InteractiveOpBlock:
                     "tasks": [_task_to_dict(t) for t in s.tasks.values()],
                     "incomplete_ids": sorted(s.incomplete_ids),
                     "paid_done_ids": sorted(s.paid_done_ids),
+                    "server_done_ids": sorted(s.server_done_ids),
                 }
                 for s in self._states.values()
             ],
@@ -902,6 +932,7 @@ class InteractiveOpBlock:
                     tasks={},
                     incomplete_ids={int(i) for i in block.get("incomplete_ids") or []},
                     paid_done_ids={int(i) for i in block.get("paid_done_ids") or []},
+                    server_done_ids={int(i) for i in block.get("server_done_ids") or []},
                     completed=bool(block.get("completed")),
                     # Дампы без флага (первые версии 1.3.2): False —
                     # completion, случившийся в простое бота, будет
@@ -1109,9 +1140,15 @@ class InteractiveOpBlock:
         before = (frozenset(state.incomplete_ids), state.completed)
         state.expires_at = _parse_dt(expires_at) or state.expires_at
         server_incomplete = {int(i) for i in incomplete_task_ids}
+        # Терминальная фиксация серверных завершений: известные задания
+        # вне incomplete-списка выполнены навсегда.
+        state.server_done_ids.update(
+            i for i in state.incomplete_ids if i not in server_incomplete
+        )
+        done = state.paid_done_ids | state.server_done_ids
         state.incomplete_ids = {
             i for i in state.incomplete_ids
-            if i in server_incomplete and i not in state.paid_done_ids
+            if i in server_incomplete and i not in done
         }
         state.access_allowed = state.access_allowed or bool(access_allowed)
         state.completed = state.access_allowed or not state.incomplete_ids
