@@ -274,8 +274,14 @@ handled = await block.handle_callback(
 клавиатуре нет — подтверждение заданий делает сервер. Блок подтягивает
 результат throttled `POST /check` на наблюдаемых событиях пользователя
 (`open()`, любой `paop:*` callback; не чаще `check_min_interval_seconds`,
-default 20с) и опциональным bounded fallback-циклом
-`reconcile_interval_seconds` (до expiry/240 итераций, по умолчанию OFF).
+default 20с) и **фоновой адаптивной синхронизацией (SDK ≥1.3.2, включена
+по умолчанию)**: один цикл на бота, батч `POST /op-sessions/sync`
+(≤50 сессий за запрос), 2с первую минуту после действия пользователя →
+5с до 3 минут → 15с до 10 минут → стоп. Выполненный слот исчезает сам —
+пользователю не нужно ни «Проверить», ни повторный `/start`.
+Отключение: `InteractiveOpBlock(..., auto_sync=False)` (поведение 1.3.1).
+Для работы нужен запущенный event loop (обычный aiogram/aiohttp-бот) и
+перезапуск бота после обновления пакета.
 
 - **Negotiation**: `block.open()` сам передаёт
   `capabilities=['callback_cta','interactive_op']`. Если сервер не
@@ -293,9 +299,16 @@ default 20с) и опциональным bounded fallback-циклом
   retry (backoff, `max_render_retries`), без шторма.
 - **Рестарт**: `dump_state()` → сохранить dict → `restore_state()` +
   `resume()` после запуска — клавиатуры перестраиваются из `status`.
-- **Мягкий sync**: опциональный `reconcile_interval_seconds` — фон-refresh
-  через `GET /status` пока сессия жива (по умолчанию выключен; это НЕ
-  polling всех сессий каждую секунду).
+- **Фоновый sync (1.3.2)**: батч на бота, а не запрос на сессию; backoff
+  на 429/сбоях (не короче серверного `Retry-After`); на старом сервере —
+  откат на `GET /status`. После 10 минут молчания пользователя — редкий
+  idle-poll (120с) до expiry сессии: подписка «вернувшегося молча»
+  снимает слот без /start. Legacy `reconcile_interval_seconds` действует
+  только при `auto_sync=False`.
+- **Completion event (1.3.2)**: `on_completed(user_id, op_session_id)` —
+  ровно один раз на сессию; точка, где бот продолжает исходный сценарий
+  пользователя (обработку ссылки и т.п.) без повторного /start.
+- **Shutdown**: `await block.aclose()` отменяет фоновые задачи.
 
 Полный рабочий пример — `examples/aiogram3_interactive_op.py`.
 

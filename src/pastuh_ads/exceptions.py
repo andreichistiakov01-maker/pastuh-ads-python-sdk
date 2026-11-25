@@ -38,12 +38,15 @@ class PastuhAdsError(Exception):
         status_code: int = 0,
         error_code: str | None = None,
         details: dict[str, Any] | None = None,
+        retry_after: float | None = None,
     ) -> None:
         super().__init__(message)
         self.message = message
         self.status_code = status_code
         self.error_code = error_code
         self.details = details
+        # Retry-After (сек) из ответа 429 — серверная подсказка backoff'у.
+        self.retry_after = retry_after
 
     def __str__(self) -> str:
         parts = [self.message]
@@ -75,7 +78,8 @@ class ValidationError(PastuhAdsError):
 
 
 class RateLimitError(PastuhAdsError):
-    """429 — превышен лимит запросов."""
+    """429 — превышен лимит запросов. ``retry_after`` — из заголовка
+    Retry-After, если сервер его вернул (None — подсказки нет)."""
 
 
 class ServerError(PastuhAdsError):
