@@ -1,5 +1,26 @@
 # Changelog — Pastuh Ads Partner SDK
 
+## 1.3.1
+
+### Изменено
+
+- **OP V2: нейтральные CTA-подписи.** Названия и @username
+  рекламируемых ресурсов убраны из кнопок: сервер теперь отдаёт
+  `action_button_text` «Открыть канал» / «Запустить бота»;
+  SDK-формируемые подписи приведены к тому же контракту —
+  reopen-CTA «🔁 Запустить бота», destination-слот «Перейдите по кнопке
+  и нажмите «Запустить».» с кнопкой «Запустить бота». Маршрутизация
+  остаётся уникальной по task_id/callback_data/URL.
+- `examples/aiohttp_interactive_op.py` и `examples/aiogram3_bot.py`
+  обновлены до нейтральных подписей.
+
+### Совместимость
+
+Без breaking changes: публичные сигнатуры, callback-контракты
+(`paop:open`, `paop:reopen`, `paop:check`) и финансовая семантика
+(клик — billable event для tokenless) не изменены. Нейтральные
+подписи hosted и external OP идентичны.
+
 ## 1.3.0
 
 ### Добавлено

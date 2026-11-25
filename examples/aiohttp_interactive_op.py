@@ -99,7 +99,9 @@ STATE_PATH = os.environ.get("PASTUH_ADS_STATE_PATH", "op_state.json")
 
 MAIN_TEXT = "Чтобы продолжить, подпишитесь на ресурсы."
 DONE_TEXT = "🎉 Все задания выполнены. Доступ открыт!"
-SLOT_BUTTON = "Перейти"
+# OP V2: нейтральные подписи — имя/username ресурса не показываем.
+SLOT_TEXT = "Перейдите по кнопке и нажмите «Запустить»."
+SLOT_BUTTON = "Запустить бота"
 
 # Event-driven проверка (UX v2): piggyback /check на событиях
 # пользователя — не чаще CHECK_MIN_INTERVAL секунд.
@@ -292,8 +294,7 @@ class OpBlock:
                 continue
             url = t.get("target_url") or t.get("url")
             if url and url.startswith("https://t.me/"):
-                label = f"@{t['username']}" if t.get("username") else "бота"
-                rows.append([{"text": f"🔁 Открыть {label}",
+                rows.append([{"text": "🔁 Запустить бота",
                               "callback_data": f"paop:reopen:{t['task_id']}"}])
 
         # Кнопки «Проверить» нет (UX v2): выполнение подтягивается
@@ -331,14 +332,10 @@ class OpBlock:
         url = task.get("target_url") or task.get("url")
         if not url or not url.startswith("https://t.me/"):
             return
-        username = task.get("username") or ""
-        text = (f"Перейдите в @{username} и нажмите «Запустить»."
-                if username else "Нажмите кнопку ниже, чтобы перейти:")
-        label = f"Перейти в @{username}" if username else SLOT_BUTTON
         old = state.get("slot_msg_id")
         try:
-            mid = await self.send(state["chat_id"], text,
-                                  [[{"text": label, "url": url}]])
+            mid = await self.send(state["chat_id"], SLOT_TEXT,
+                                  [[{"text": SLOT_BUTTON, "url": url}]])
             state["slot_msg_id"] = mid
             asyncio.create_task(self._slot_ttl(state, mid))
         except Exception as exc:  # noqa: BLE001

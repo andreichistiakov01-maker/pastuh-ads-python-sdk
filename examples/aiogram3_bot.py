@@ -64,7 +64,7 @@ def op_keyboard(op_list) -> InlineKeyboardMarkup:
 
     bot_tracked_click с open_mode="callback" → callback-кнопка
     (нажатие фиксируется через register_callback_click, затем нативная
-    t.me-кнопка «Перейти в бота»). Остальные → обычные url-кнопки.
+    t.me-кнопка «Запустить бота»). Остальные → обычные url-кнопки.
     """
     rows = []
     for task in op_list.tasks:
@@ -196,10 +196,10 @@ async def on_check(callback: CallbackQuery) -> None:
 
 
 # --- Callback-CTA: bot_tracked_click (оплачиваемое нажатие) ----------------
-# Согласованный флоу: пользователь жмёт «Открыть бота» в OP → ваш бот
+# Согласованный флоу: пользователь жмёт «Запустить бота» в OP → ваш бот
 # ловит callback_query → register_callback_click фиксирует биллинг на
 # бэкенде → отвечаете на callback БЕЗ url → отправляете сообщение с
-# нативной url-кнопкой «Перейти в бота» на response.target_url.
+# нативной url-кнопкой «Запустить бота» на response.target_url.
 #
 # НЕ используйте callback.answer(url=...) для перехода в другого бота —
 # Telegram отклоняет такой url ошибкой URL_INVALID. Повторный callback
@@ -221,7 +221,7 @@ async def on_tracked_click(callback: CallbackQuery) -> None:
         await callback.message.answer(
             "После выполнения нажмите «Проверить».",
             reply_markup=InlineKeyboardMarkup(inline_keyboard=[
-                [InlineKeyboardButton(text="Перейти в бота", url=result.target_url)],
+                [InlineKeyboardButton(text="Запустить бота", url=result.target_url)],
                 [InlineKeyboardButton(text="✅ Проверить", callback_data="op_check")],
             ]),
         )
