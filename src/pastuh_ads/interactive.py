@@ -28,9 +28,9 @@ tokenless destination живёт в TTL-слоте и переоткрывает
   финансового вызова по построению.
 - Reconcile: при временных ошибках Telegram — ограниченные повторы
   (экспоненциальный backoff, максимум ``max_render_retries``) + ленивое
-  восстановление при следующем событии. Бесконечных retry и
-  массового polling нет: опциональный ``reconcile_interval_seconds``
-  по умолчанию выключен.
+  восстановление при следующем событии. Бесконечных retry нет;
+  фоновая синхронизация — батч на бота с адаптивным расписанием
+  и остановкой (см. ниже), а не polling каждой сессии.
 - Restart: ``dump_state()``/``restore_state()`` сериализуют сессии
   (dict — партнёр может держать их в Redis/памяти), ``resume()``
   перечитывает status и перестраивает клавиатуру — process restart
@@ -55,9 +55,14 @@ BotStartEvent / presence-проба), а блок узнаёт об этом д�
   и любой ``paop:*`` callback вызывают ``POST /check`` не чаще, чем раз
   в ``check_min_interval_seconds`` (default 20) — подписка, случившаяся
   между событиями, подтягивается без ручной кнопки;
-- опциональный bounded fallback ``reconcile_interval_seconds`` —
-  мягкий ``GET /status`` цикл до expiry/240 итераций (по умолчанию
-  выключен).
+- фоновая адаптивная синхронизация (1.3.2, ``auto_sync=True`` по
+  умолчанию): ОДИН цикл на блок (бота) батчем ``POST /op-sessions/sync``
+  (≤50 сессий за запрос, не чаще ``sync_min_interval_seconds``) по
+  расписанию от последнего действия пользователя — 2с первую минуту,
+  5с до 3 минут, 15с до 10 минут, затем остановка до следующего
+  события. Останавливается на completion/expiry, backoff на 429/сбоях,
+  на старом сервере (404) — откат на ``GET /status``. Legacy
+  ``reconcile_interval_seconds`` работает только при ``auto_sync=False``.
 """
 
 from __future__ import annotations
@@ -65,13 +70,14 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import logging
+import re
 import time
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from typing import Any, Awaitable, Callable
 
 from .client import PastuhAdsClient
-from .exceptions import PastuhAdsError
+from .exceptions import NotFoundError, PastuhAdsError, RateLimitError
 from .models import OpTask, SessionStatusResponse
 from .observation import user_observation_from_user
 
@@ -99,6 +105,18 @@ _COMPLETED_TEXT = "🎉 Все задания выполнены. Доступ �
 _SLOT_TEXT = "Перейдите по кнопке и нажмите «Запустить»."
 _SLOT_BUTTON_TEXT = "Запустить бота"
 _MAX_BUTTON_TEXT = 64  # лимит подписи inline-кнопки Telegram, байт
+
+# Адаптивное расписание фоновой синхронизации: (сек. с последнего
+# действия пользователя, интервал). Дальше последней границы — стоп
+# до следующего события (open/callback/resume).
+_SYNC_PHASES: tuple[tuple[float, float], ...] = ((60.0, 2.0), (180.0, 5.0), (600.0, 15.0))
+_SYNC_BATCH = 50
+_SYNC_FIRST_DELAY = 1.0  # первый sync после действия пользователя
+_SYNC_MIN_INTERVAL_FLOOR = 1.0  # нижняя граница интервала батч-запросов блока
+_SYNC_FALLBACK_MIN_INTERVAL = 5.0  # GET /status на старом сервере — реже
+_SYNC_FALLBACK_PER_TICK = 3
+_STATE_RETENTION_SECONDS = 3600.0  # истёкшие блоки держим час (reopen/ответы), затем удаляем
+_RETRY_AFTER_RE = re.compile(r"retry after (\d+)", re.IGNORECASE)
 
 CB_OPEN = "paop:open:"
 CB_REOPEN = "paop:reopen:"
@@ -140,6 +158,9 @@ class _BlockState:
     shown_marked: bool = False
     render_failures: int = 0
     last_check_mono: float = 0.0  # piggyback /check throttle (monotonic)
+    sync_active: bool = False  # участвует в фоновой синхронизации
+    last_activity_mono: float = 0.0  # последнее действие пользователя
+    next_sync_mono: float = 0.0
     lock: asyncio.Lock = field(default_factory=asyncio.Lock)
     slot_task: asyncio.Task | None = None
     reconcile_task: asyncio.Task | None = None
@@ -168,9 +189,15 @@ class InteractiveOpBlock:
         max_render_retries: число дополнительных попыток рендера после
             временной ошибки Telegram (backoff 2/5/15с), затем — ленивое
             восстановление при следующем событии.
-        reconcile_interval_seconds: опциональный мягкий фон-refresh через
-            ``get_session_status`` (по умолчанию None = выключен). Это НЕ
-            массовый polling — задача живёт только пока активна сессия.
+        reconcile_interval_seconds: legacy фон-refresh через
+            ``get_session_status`` (1.3.1). Действует только при
+            ``auto_sync=False`` — иначе его заменяет адаптивная синхронизация.
+        auto_sync: фоновая адаптивная синхронизация активных сессий
+            (default True): выполненные слоты исчезают без «Проверить»,
+            повторного /start и действий пользователя. False — поведение
+            1.3.1.
+        sync_min_interval_seconds: минимальный интервал между батч-запросами
+            синхронизации одного блока (default 2.0, не меньше 1.0).
         check_min_interval_seconds: минимальный интервал между piggyback
             ``POST /check`` на наблюдаемых событиях пользователя
             (default 20). 0 — piggyback-проверки выключены.
@@ -191,6 +218,8 @@ class InteractiveOpBlock:
         reconcile_interval_seconds: float | None = None,
         check_min_interval_seconds: float = 20.0,
         on_error: ErrorHook | None = None,
+        auto_sync: bool = True,
+        sync_min_interval_seconds: float = 2.0,
     ) -> None:
         self._client = client
         self._send = send_message
@@ -202,6 +231,12 @@ class InteractiveOpBlock:
         self._reconcile_interval = reconcile_interval_seconds
         self._check_min_interval = max(0.0, float(check_min_interval_seconds))
         self._on_error = on_error
+        self._auto_sync = bool(auto_sync)
+        self._sync_min_interval = float(sync_min_interval_seconds)
+        self._sync_task: asyncio.Task | None = None
+        self._sync_batch_supported = True
+        self._sync_failures = 0
+        self._sync_pause_until = 0.0
         # Ключ состояния — telegram_user_id: одна живая OP-сессия на
         # пользователя у партнёра (сервер переиспользует открытую).
         self._states: dict[int, _BlockState] = {}
@@ -232,6 +267,7 @@ class InteractiveOpBlock:
         Returns:
             message_id основного OP-сообщения.
         """
+        self._prune_states()
         state = self._states.get(telegram_user_id)
         if state is not None and state.chat_id != chat_id:
             # Другой чат — новая сессия. Старый state вытесняется: его
@@ -293,7 +329,9 @@ class InteractiveOpBlock:
             await self._maybe_check(state)
             await self._render(state)
 
-        if self._reconcile_interval is not None:
+        if self._auto_sync:
+            self._touch(state)
+        elif self._reconcile_interval is not None:
             self._ensure_reconcile(state)
 
         return state.message_id
@@ -341,6 +379,8 @@ class InteractiveOpBlock:
         # выше — он сам и есть проверка.
         await self._maybe_check(state)
 
+        # Действие пользователя — фоновая синхронизация в быстрой фазе.
+        self._touch(state)
         for prefix, handler in ((CB_OPEN, self._handle_open), (CB_REOPEN, self._handle_reopen)):
             if data.startswith(prefix):
                 raw_id = data[len(prefix):]
@@ -631,7 +671,7 @@ class InteractiveOpBlock:
                 return
             self._report("render", exc)
             state.render_failures += 1
-            self._schedule_render_retry(state)
+            self._schedule_render_retry(state, _retry_after_seconds(exc))
             return
         await self._ensure_shown(state)
 
@@ -667,13 +707,16 @@ class InteractiveOpBlock:
             return
         state.shown_marked = True
 
-    def _schedule_render_retry(self, state: _BlockState) -> None:
+    def _schedule_render_retry(self, state: _BlockState, retry_after: float | None = None) -> None:
         """Ограниченное восстановление после временной ошибки: экспоненциальный
         backoff, максимум max_render_retries попыток — дальше ленивая
-        reconcile при следующем пользовательском событии."""
+        reconcile при следующем пользовательском событии. Telegram 429
+        (``retry after N``) — ждём ровно указанное время (≤ 60с)."""
         if state.render_failures > self._max_render_retries:
             return
         delay = min(2.0 * (state.render_failures ** 2), 30.0)
+        if retry_after is not None:
+            delay = min(max(delay, retry_after + 0.5), 60.0)
         attempt_rev = state.rev
 
         async def _retry() -> None:
@@ -862,20 +905,185 @@ class InteractiveOpBlock:
                     continue
                 await self._sync_status(state, trigger_check=False)
                 await self._render(state)
+                if self._auto_sync:
+                    self._touch(state)
             except (PastuhAdsError, Exception) as exc:  # noqa: BLE001
                 self._report("resume", exc)
 
     async def aclose(self) -> None:
-        """Отменить фоновые задачи (slot TTL, retry, reconcile)."""
-        for state in self._states.values():
-            for task in (state.slot_task, state.reconcile_task):
-                if task is not None and not task.done():
-                    task.cancel()
-        await asyncio.gather(
-            *[t for s in self._states.values()
-              for t in (s.slot_task, s.reconcile_task) if t is not None],
-            return_exceptions=True,
-        )
+        """Отменить фоновые задачи (slot TTL, retry, reconcile, sync)."""
+        pending = [t for s in self._states.values()
+                   for t in (s.slot_task, s.reconcile_task) if t is not None]
+        if self._sync_task is not None:
+            pending.append(self._sync_task)
+        for task in pending:
+            if not task.done():
+                task.cancel()
+        await asyncio.gather(*pending, return_exceptions=True)
+        self._sync_task = None
+
+    # ------------------------------------------------------------------
+    # Фоновая адаптивная синхронизация (1.3.2)
+    # ------------------------------------------------------------------
+
+    def _touch(self, state: _BlockState, *, delay: float | None = None) -> None:
+        """Действие пользователя: блок в быструю фазу, ближайший sync через
+        ``delay``. Один общий цикл на блок — повторы не плодят циклов."""
+        if not self._auto_sync or state.completed or self._expired(state):
+            return
+        now = time.monotonic()
+        state.last_activity_mono = now
+        due = now + (_SYNC_FIRST_DELAY if delay is None else delay)
+        state.next_sync_mono = min(state.next_sync_mono, due) if state.sync_active else due
+        state.sync_active = True
+        self._ensure_sync_loop()
+
+    def _ensure_sync_loop(self) -> None:
+        if self._sync_task is not None and not self._sync_task.done():
+            return
+        try:
+            self._sync_task = asyncio.ensure_future(self._sync_loop())
+        except RuntimeError:
+            self._sync_task = None  # нет запущенного event loop
+
+    @staticmethod
+    def _sync_interval(state: _BlockState, now: float) -> float | None:
+        idle = now - state.last_activity_mono
+        for limit, interval in _SYNC_PHASES:
+            if idle < limit:
+                return interval
+        return None
+
+    async def _sync_loop(self) -> None:
+        try:
+            while True:
+                now = time.monotonic()
+                if now < self._sync_pause_until:
+                    await asyncio.sleep(self._sync_pause_until - now)
+                    continue
+                active: list[_BlockState] = []
+                for state in list(self._states.values()):
+                    if not state.sync_active:
+                        continue
+                    if state.completed or self._expired(state) or self._sync_interval(state, now) is None:
+                        state.sync_active = False
+                        continue
+                    active.append(state)
+                if not active:
+                    return
+                due = sorted((s for s in active if s.next_sync_mono <= now),
+                             key=lambda s: s.next_sync_mono)
+                if not due:
+                    wake = min(s.next_sync_mono for s in active)
+                    await asyncio.sleep(max(0.05, wake - now))
+                    continue
+                await self._sync_due(due)
+                gap = max(_SYNC_MIN_INTERVAL_FLOOR, self._sync_min_interval)
+                await asyncio.sleep(gap if len(due) <= _SYNC_BATCH else _SYNC_MIN_INTERVAL_FLOOR)
+        except asyncio.CancelledError:
+            return
+
+    async def _sync_due(self, due: list[_BlockState]) -> None:
+        now = time.monotonic()
+        try:
+            if self._sync_batch_supported:
+                batch = due[:_SYNC_BATCH]
+                for state in batch:
+                    state.next_sync_mono = now + (self._sync_interval(state, now) or 15.0)
+                try:
+                    response = await self._client.sync_sessions([s.op_session_id for s in batch])
+                except NotFoundError:
+                    # Сервер без /op-sessions/sync — GET /status реже и порциями.
+                    self._sync_batch_supported = False
+                    await self._sync_individually(batch)
+                else:
+                    by_id = {item.op_session_id: item for item in response.sessions}
+                    unknown = set(response.unknown_session_ids)
+                    for state in batch:
+                        if state.op_session_id in unknown:
+                            state.sync_active = False
+                            continue
+                        item = by_id.get(state.op_session_id)
+                        if item is not None and self._apply_snapshot(
+                            state, item.incomplete_task_ids, item.access_allowed,
+                            item.expires_at, item.session_status,
+                        ):
+                            self._spawn(state, self._render(state))
+            else:
+                await self._sync_individually(due[:_SYNC_FALLBACK_PER_TICK])
+        except RateLimitError as exc:
+            self._sync_backoff(exc, base=5.0, cap=60.0)
+            return
+        except PastuhAdsError as exc:
+            self._sync_backoff(exc, base=2.0, cap=30.0)
+            return
+        except Exception as exc:  # noqa: BLE001 — фоновый цикл не должен умирать
+            self._sync_backoff(exc, base=2.0, cap=30.0)
+            return
+        self._sync_failures = 0
+
+    async def _sync_individually(self, states: list[_BlockState]) -> None:
+        now = time.monotonic()
+        for state in states:
+            state.next_sync_mono = now + max(
+                self._sync_interval(state, now) or 15.0, _SYNC_FALLBACK_MIN_INTERVAL)
+            try:
+                status = await self._client.get_session_status(state.op_session_id)
+            except RateLimitError:
+                raise
+            except PastuhAdsError as exc:
+                if exc.error_code == "session_expired" or exc.status_code in (403, 404, 409):
+                    state.sync_active = False
+                    continue
+                raise
+            if self._apply_snapshot(
+                state, [t.task_id for t in status.incomplete_tasks],
+                status.access_allowed, status.expires_at, status.session_status,
+            ):
+                self._spawn(state, self._render(state))
+
+    def _sync_backoff(self, exc: BaseException, *, base: float, cap: float) -> None:
+        self._report("sync", exc)
+        self._sync_failures += 1
+        delay = min(cap, base * (2 ** (self._sync_failures - 1)))
+        self._sync_pause_until = time.monotonic() + delay
+
+    def _apply_snapshot(
+        self,
+        state: _BlockState,
+        incomplete_task_ids: list[int],
+        access_allowed: bool,
+        expires_at: str | None,
+        session_status: str,
+    ) -> bool:
+        """Монотонный merge снимка: задания только убывают — выполненное
+        никогда не возвращается на клавиатуру. True — нужно перерисовать."""
+        before = (frozenset(state.incomplete_ids), state.completed)
+        state.expires_at = _parse_dt(expires_at) or state.expires_at
+        server_incomplete = {int(i) for i in incomplete_task_ids}
+        state.incomplete_ids = {
+            i for i in state.incomplete_ids
+            if i in server_incomplete and i not in state.paid_done_ids
+        }
+        state.access_allowed = state.access_allowed or bool(access_allowed)
+        state.completed = state.access_allowed or not state.incomplete_ids
+        if state.completed or session_status in ("expired", "failed"):
+            state.sync_active = False
+        return before != (frozenset(state.incomplete_ids), state.completed)
+
+    def _prune_states(self) -> None:
+        """Удалить давно истёкшие блоки — без роста памяти у долгоживущего бота."""
+        now = datetime.now(timezone.utc).timestamp()
+        stale = [
+            uid for uid, s in self._states.items()
+            if s.expires_at is not None
+            and now - s.expires_at.timestamp() > _STATE_RETENTION_SECONDS
+            and (s.slot_task is None or s.slot_task.done())
+        ]
+        for uid in stale:
+            state = self._states.pop(uid)
+            if state.reconcile_task is not None and not state.reconcile_task.done():
+                state.reconcile_task.cancel()
 
     # ------------------------------------------------------------------
     # Вспомогательное
@@ -906,6 +1114,16 @@ class InteractiveOpBlock:
 
         task.add_done_callback(_watch)
         return task
+
+
+def _retry_after_seconds(exc: BaseException) -> float | None:
+    """Telegram 429: aiogram ``TelegramRetryAfter.retry_after`` или текст
+    ``Too Many Requests: retry after N``."""
+    value = getattr(exc, "retry_after", None)
+    if isinstance(value, (int, float)) and value >= 0:
+        return float(value)
+    match = _RETRY_AFTER_RE.search(str(exc))
+    return float(match.group(1)) if match else None
 
 
 def _is_gone_message_error(lowered: str) -> bool:

@@ -100,6 +100,9 @@ block = InteractiveOpBlock(
     edit_text=tg_edit_text,
     delete_message=tg_delete,
     slot_ttl_seconds=15.0,
+    # SDK ≥1.3.2: фоновая синхронизация включена по умолчанию —
+    # выполненные слоты исчезают без «Проверить» и повторного /start.
+    # auto_sync=False возвращает поведение 1.3.1.
 )
 
 dp = Dispatcher()
@@ -139,7 +142,10 @@ async def main() -> None:
     # В проде: восстановить сохранённое состояние до polling —
     # resume() перечитает status и пересоберёт клавиатуры.
     # block.restore_state(saved_dict); await block.resume()
-    await dp.start_polling(bot)
+    try:
+        await dp.start_polling(bot)
+    finally:
+        await block.aclose()
 
 
 if __name__ == "__main__":

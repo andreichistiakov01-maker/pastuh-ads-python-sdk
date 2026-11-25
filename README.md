@@ -70,6 +70,9 @@ block = InteractiveOpBlock(
     edit_text=tg_edit_text,      # async (chat_id, message_id, text, rows)
     delete_message=tg_delete,    # async (chat_id, message_id)
     slot_ttl_seconds=15.0,
+    # SDK >= 1.3.2: background adaptive sync is ON by default — completed
+    # slots disappear without "Check" or a repeated /start (one batched
+    # POST /op-sessions/sync per bot). auto_sync=False restores 1.3.1.
 )
 
 # /start → одно сообщение со всеми заданиями

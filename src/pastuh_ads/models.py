@@ -187,6 +187,30 @@ class SessionStatusResponse:
 
 
 @dataclass
+class SessionSyncItem:
+    """Компактный снимок одной сессии из POST /op-sessions/sync (1.3.2)."""
+
+    op_session_id: int
+    session_status: str
+    access_allowed: bool
+    expires_at: str | None
+    completed_task_ids: list[int]
+    incomplete_task_ids: list[int]
+    raw: dict[str, Any] = field(default_factory=dict, repr=False)
+
+
+@dataclass
+class SessionSyncResponse:
+    """Ответ POST /op-sessions/sync: снимки + id, которые сервер не знает
+    (чужие/удалённые) — их синхронизацию SDK прекращает."""
+
+    sessions: list[SessionSyncItem]
+    unknown_session_ids: list[int]
+    server_time: str | None
+    raw: dict[str, Any] = field(default_factory=dict, repr=False)
+
+
+@dataclass
 class ClickResponse:
     """Ответ POST /tasks/{id}/click."""
 

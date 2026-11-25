@@ -47,6 +47,8 @@ from .models import (
     PremiumVerificationInfo,
     PremiumVerificationResponse,
     SessionStatusResponse,
+    SessionSyncItem,
+    SessionSyncResponse,
     ShownResponse,
     SourceInfo,
 )
@@ -82,6 +84,8 @@ __all__ = [
     "PremiumVerificationResponse",
     "ShownResponse",
     "SessionStatusResponse",
+    "SessionSyncItem",
+    "SessionSyncResponse",
     "ClickResponse",
     "CallbackClickResponse",
     "BotStartConfirmResponse",

@@ -51,6 +51,8 @@ from .models import (
     PremiumVerificationInfo,
     PremiumVerificationResponse,
     SessionStatusResponse,
+    SessionSyncItem,
+    SessionSyncResponse,
     ShownResponse,
     SourceInfo,
 )
@@ -312,6 +314,39 @@ class PastuhAdsClient:
         """GET /op-sessions/{id}/status — текущий статус без повторной проверки."""
         data = await self._request("GET", f"/op-sessions/{int(op_session_id)}/status")
         return self._session_status(data)
+
+    async def sync_sessions(self, op_session_ids: list[int]) -> SessionSyncResponse:
+        """POST /op-sessions/sync — батч-снимок до 50 сессий (read-only).
+
+        Используется фоновой синхронизацией ``InteractiveOpBlock``: один
+        запрос на бота вместо ``/status`` на каждую сессию. Сервер < 1.3.2
+        контракта отвечает 404 — вызывающая сторона откатывается на
+        ``get_session_status``.
+        """
+        data = await self._request(
+            "POST",
+            "/op-sessions/sync",
+            json={"op_session_ids": [int(i) for i in op_session_ids]},
+            idempotent=True,
+        )
+        return SessionSyncResponse(
+            sessions=[
+                SessionSyncItem(
+                    op_session_id=int(item["op_session_id"]),
+                    session_status=str(item.get("session_status") or ""),
+                    access_allowed=bool(item.get("access_allowed")),
+                    expires_at=item.get("expires_at"),
+                    completed_task_ids=[int(i) for i in item.get("completed_task_ids") or []],
+                    incomplete_task_ids=[int(i) for i in item.get("incomplete_task_ids") or []],
+                    raw=item,
+                )
+                for item in data.get("sessions") or []
+                if isinstance(item, dict) and item.get("op_session_id")
+            ],
+            unknown_session_ids=[int(i) for i in data.get("unknown_session_ids") or []],
+            server_time=data.get("server_time"),
+            raw=data,
+        )
 
     async def register_click(
         self, task_id: int, telegram_user_id: int | str
