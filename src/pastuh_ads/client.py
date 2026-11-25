@@ -565,11 +565,20 @@ class PastuhAdsClient:
 
         exc_cls = _STATUS_TO_ERROR.get(response.status_code)
         if exc_cls is not None:
+            retry_after: float | None = None
+            if response.status_code == 429:
+                raw = response.headers.get("retry-after")
+                if raw is not None:
+                    try:
+                        retry_after = max(0.0, float(raw))
+                    except (TypeError, ValueError):
+                        retry_after = None
             return exc_cls(
                 message,
                 status_code=response.status_code,
                 error_code=error_code,
                 details=details,
+                retry_after=retry_after,
             )
         if response.status_code >= 500:
             return ServerError(

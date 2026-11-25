@@ -27,6 +27,9 @@ CHAT = 777_001
 @pytest.fixture(autouse=True)
 def fast_schedule(monkeypatch):
     monkeypatch.setattr(interactive_mod, "_SYNC_PHASES", ((0.6, 0.03), (1.2, 0.06), (1.8, 0.1)))
+    monkeypatch.setattr(interactive_mod, "_SYNC_IDLE_INTERVAL", 0.15)
+    monkeypatch.setattr(interactive_mod, "_SYNC_IDLE_GIVEUP", 3.0)
+    monkeypatch.setattr(interactive_mod, "_SYNC_JITTER", 0.0)
     monkeypatch.setattr(interactive_mod, "_SYNC_FIRST_DELAY", 0.01)
     monkeypatch.setattr(interactive_mod, "_SYNC_MIN_INTERVAL_FLOOR", 0.01)
     monkeypatch.setattr(interactive_mod, "_SYNC_FALLBACK_MIN_INTERVAL", 0.03)
@@ -381,4 +384,195 @@ async def test_expired_states_are_pruned(client, tg):
     }]})
     block._prune_states()
     assert list(block._states) == [2]
+    await client.aclose()
+
+
+@respx.mock
+async def test_idle_poll_until_expiry_completion_after_inactivity(client, tg):
+    """Сценарий приёмки: пользователь неактивен дольше всех быстрых фаз
+    (в проде — 12+ минут), затем подписывается молча. Слот исчезает
+    через редкий idle-poll — без /start и callback."""
+    _mock_open(TWO_CHANNELS)
+    # Сервер подтверждает задание в момент, когда блок уже давно в idle.
+    calls = {"n": 0}
+
+    def sync_handler(req):
+        calls["n"] += 1
+        done = [11] if calls["n"] >= 3 else []
+        return httpx.Response(200, json=_sync_body(
+            _snap(77, [12] if done else [11, 12], done)))
+
+    sync = respx.post(f"{BASE}/op-sessions/sync").mock(side_effect=sync_handler)
+
+    block = make_block(client, tg)
+    await block.open(UID, CHAT)
+    # Ждём выхода за пределы быстрых фаз (0.6/1.2/1.8с в ускорении) —
+    # sync-запросы НЕ прекращаются, а переходят в idle-режим.
+    await asyncio.sleep(2.0)
+    n_before = calls["n"]
+    assert n_before >= 1
+    assert block._states[UID].sync_active  # цикл жив, а не остановлен
+    await asyncio.sleep(0.5)
+    assert calls["n"] > n_before  # idle-poll продолжается
+
+    # «Подписка» подтверждена сервером — кнопка исчезает без действий.
+    assert await _wait(lambda: tg.edits)
+    buttons = tg.flat_buttons(tg.edits[-1][2])
+    assert [b["url"] for b in buttons] == ["https://t.me/chan_b"]
+    await block.aclose()
+    await client.aclose()
+
+
+@respx.mock
+async def test_idle_giveup_bounds_lifetime(client, tg):
+    """Аварийный giveup: после _SYNC_IDLE_GIVEUP бездействия polling
+    останавливается даже без expiry — память/сеть ограничены."""
+    _mock_open(TWO_CHANNELS)
+    sync = respx.post(f"{BASE}/op-sessions/sync").mock(
+        return_value=httpx.Response(200, json=_sync_body(_snap(77, [11, 12], []))))
+
+    block = make_block(client, tg)
+    await block.open(UID, CHAT)
+    await asyncio.sleep(3.4)  # giveup = 3.0 в ускорении
+    assert not block._states[UID].sync_active
+    calls = sync.call_count
+    await asyncio.sleep(0.4)
+    assert sync.call_count == calls
+    await block.aclose()
+    await client.aclose()
+
+
+@respx.mock
+async def test_on_completed_fires_once_sync_detected(client, tg):
+    """Completion event партнёра: фоновая синхронизация обнаружила
+    выполнение — callback вызван ровно один раз, async поддержан."""
+    _mock_open(TWO_CHANNELS)
+    respx.post(f"{BASE}/op-sessions/sync").mock(return_value=httpx.Response(
+        200, json=_sync_body(_snap(77, [], [11, 12], access=True))))
+    events = []
+
+    async def on_completed(uid, sid):
+        await asyncio.sleep(0)
+        events.append((uid, sid))
+
+    block = make_block(client, tg, on_completed=on_completed)
+    await block.open(UID, CHAT)
+    assert await _wait(lambda: events)
+    await asyncio.sleep(0.2)
+    assert events == [(UID, 77)]  # ровно один раз
+    await client.aclose()
+
+
+@respx.mock
+async def test_on_completed_sync_callable_and_error_isolated(client, tg):
+    """Sync-callback тоже поддержан; исключение hook'а не ломает OP."""
+    _mock_open(TWO_CHANNELS)
+    respx.post(f"{BASE}/op-sessions/sync").mock(return_value=httpx.Response(
+        200, json=_sync_body(_snap(77, [], [11, 12], access=True))))
+    events = []
+
+    def bad_hook(uid, sid):
+        events.append((uid, sid))
+        raise RuntimeError("partner bug")
+
+    block = make_block(client, tg, on_completed=bad_hook)
+    await block.open(UID, CHAT)
+    assert await _wait(lambda: events)
+    assert await _wait(lambda: tg.text_edits)  # completion-рендер не пострадал
+    assert tg.text_edits[-1][2] == interactive_mod._COMPLETED_TEXT
+    await asyncio.sleep(0.1)
+    assert events == [(UID, 77)]
+    await client.aclose()
+
+
+@respx.mock
+async def test_on_completed_not_refired_after_restore(client, tg):
+    """Exactly-once переживает restart: уведомлённая сессия не стреляет
+    повторно; завершившаяся в простое — стреляет один раз при resume."""
+    _mock_open(TWO_CHANNELS)
+    respx.post(f"{BASE}/op-sessions/sync").mock(return_value=httpx.Response(
+        200, json=_sync_body(_snap(77, [], [11, 12], access=True))))
+    respx.get(f"{BASE}/op-sessions/77/status").mock(return_value=httpx.Response(
+        200, json=_status_payload([TWO_CHANNELS[0], TWO_CHANNELS[1]], [], session_id=77,
+                                  access=True)))
+    events = []
+
+    async def hook(uid, sid):
+        events.append((uid, sid))
+
+    block = make_block(client, tg, on_completed=hook)
+    await block.open(UID, CHAT)
+    assert await _wait(lambda: events)
+    assert events == [(UID, 77)]
+    dump = block.dump_state()
+    await block.aclose()
+
+    # Рестарт: флаг персистирован — повторного события нет.
+    block2 = make_block(client, tg, on_completed=hook)
+    block2.restore_state(dump)
+    await block2.resume()
+    await asyncio.sleep(0.3)
+    assert events == [(UID, 77)]
+    await block2.aclose()
+    await client.aclose()
+
+
+def test_retry_after_honored_in_backoff(client, tg):
+    """429 с Retry-After: пауза не меньше серверной подсказки; без
+    подсказки — экспоненциальный backoff."""
+    import time as _time
+
+    from pastuh_ads import RateLimitError
+
+    block = make_block(client, tg)
+    before = _time.monotonic()
+    block._sync_backoff(RateLimitError("x", status_code=429, retry_after=30.0), base=5.0, cap=60.0)
+    assert 29.0 <= block._sync_pause_until - before <= 31.0
+
+    block._sync_failures = 0
+    block._sync_pause_until = 0.0
+    before = _time.monotonic()
+    block._sync_backoff(RateLimitError("x", status_code=429), base=5.0, cap=60.0)
+    pause = block._sync_pause_until - before
+    assert 4.5 <= pause <= 5.5  # первая экспоненциальная ступень, не хуже
+
+
+@respx.mock
+async def test_fairness_120_sessions_all_synced(client, tg):
+    """120 активных сессий одного источника (>2 батчей по 50): ротация
+    по next_sync_mono — обслуживаются ВСЕ, голодания нет."""
+    n_sessions = 120
+    tasks_by_session = {}
+    for sid in range(1000, 1000 + n_sessions):
+        tasks_by_session[sid] = [_task(sid * 10 + 1, "subscription_confirmed", slot=1,
+                                       url=f"https://t.me/c{sid}")]
+    seen_ids: set[int] = set()
+
+    def handler(req):
+        import json as _json
+        body = _json.loads(req.content)
+        assert len(body["op_session_ids"]) <= 50  # батч-контракт
+        seen_ids.update(body["op_session_ids"])
+        snaps = [_snap(sid, [sid * 10 + 1], []) for sid in body["op_session_ids"]]
+        return httpx.Response(200, json=_sync_body(*snaps))
+
+    respx.post(f"{BASE}/op-sessions/sync").mock(side_effect=handler)
+    # Открываем сессии напрямую через состояние блока: op-list для каждого
+    # пользователя — дорого в unit-тесте, важна ротация цикла.
+    block = make_block(client, tg)
+    now = asyncio.get_running_loop().time()
+    for i, sid in enumerate(range(1000, 1000 + n_sessions)):
+        uid = 5000 + i
+        task_objs = [interactive_mod._task_from_dict(t) for t in tasks_by_session[sid]]
+        state = interactive_mod._BlockState(
+            op_session_id=sid, telegram_user_id=uid, chat_id=uid,
+            tasks={t.task_id: t for t in task_objs},
+            incomplete_ids={t.task_id for t in task_objs},
+        )
+        state.last_activity_mono = now
+        block._states[uid] = state
+        block._touch(state, delay=0.01)
+
+    assert await _wait(lambda: len(seen_ids) == n_sessions, timeout=4.0)
+    await block.aclose()
     await client.aclose()

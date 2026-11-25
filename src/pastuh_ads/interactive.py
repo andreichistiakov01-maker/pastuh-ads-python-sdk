@@ -69,7 +69,9 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import inspect
 import logging
+import random
 import re
 import time
 from dataclasses import dataclass, field
@@ -110,6 +112,13 @@ _MAX_BUTTON_TEXT = 64  # лимит подписи inline-кнопки Telegram,
 # действия пользователя, интервал). Дальше последней границы — стоп
 # до следующего события (open/callback/resume).
 _SYNC_PHASES: tuple[tuple[float, float], ...] = ((60.0, 2.0), (180.0, 5.0), (600.0, 15.0))
+# После 10 минут без действий пользователя polling НЕ прекращается:
+# редкий idle-poll до expiry сессии — подписка «вернувшегося молча»
+# пользователя всё равно снимает слот. Ограничение нагрузки: 120с —
+# 1 батч-запрос на 50 сессий в 2 минуты (≤0.42 rps на 1000 сессий).
+_SYNC_IDLE_INTERVAL = 120.0
+_SYNC_IDLE_GIVEUP = 7200.0  # аварийная остановка, если expires_at неизвестен/бит
+_SYNC_JITTER = 0.2  # ±20% — рассинхронизация стада после рестарта/ backoff'а
 _SYNC_BATCH = 50
 _SYNC_FIRST_DELAY = 1.0  # первый sync после действия пользователя
 _SYNC_MIN_INTERVAL_FLOOR = 1.0  # нижняя граница интервала батч-запросов блока
@@ -159,6 +168,7 @@ class _BlockState:
     render_failures: int = 0
     last_check_mono: float = 0.0  # piggyback /check throttle (monotonic)
     sync_active: bool = False  # участвует в фоновой синхронизации
+    completion_notified: bool = False  # on_completed уже вызван (exactly-once)
     last_activity_mono: float = 0.0  # последнее действие пользователя
     next_sync_mono: float = 0.0
     lock: asyncio.Lock = field(default_factory=asyncio.Lock)
@@ -203,6 +213,18 @@ class InteractiveOpBlock:
             (default 20). 0 — piggyback-проверки выключены.
         on_error: опциональный hook ``(context, exception)`` — для метрик;
             исключения не пробрасываются пользователю API.
+        on_completed: опциональный callback ``(telegram_user_id,
+            op_session_id)`` — sync или async. Вызывается ровно один раз
+            на сессию в момент, когда все задания подтверждены и доступ
+            открыт (любым путём: фоновая синхронизация, /check,
+            callback-click, первичный op-list). Это completion event
+            партнёрского бота: в нём уместно продолжить исходный сценарий
+            пользователя (например, начать обработку ссылки, ради которой
+            показывался ОП) — повторный /start не требуется. Исключения
+            изолированы: ошибка hook'а не влияет на OP-механику. После
+            рестарта: если сессия завершилась, пока бот был выключен,
+            callback сработает один раз при resume (флаг exactly-once
+            персистится в ``dump_state``).
     """
 
     def __init__(
@@ -218,6 +240,7 @@ class InteractiveOpBlock:
         reconcile_interval_seconds: float | None = None,
         check_min_interval_seconds: float = 20.0,
         on_error: ErrorHook | None = None,
+        on_completed: Callable[[int, int], Any] | None = None,
         auto_sync: bool = True,
         sync_min_interval_seconds: float = 2.0,
     ) -> None:
@@ -231,6 +254,7 @@ class InteractiveOpBlock:
         self._reconcile_interval = reconcile_interval_seconds
         self._check_min_interval = max(0.0, float(check_min_interval_seconds))
         self._on_error = on_error
+        self._on_completed = on_completed
         self._auto_sync = bool(auto_sync)
         self._sync_min_interval = float(sync_min_interval_seconds)
         self._sync_task: asyncio.Task | None = None
@@ -556,6 +580,7 @@ class InteractiveOpBlock:
             }
         state.completed = access_allowed or not state.incomplete_ids
         state.access_allowed = state.access_allowed or access_allowed
+        self._notify_completed(state)
 
     def _complete_task(self, state: _BlockState, task: OpTask) -> None:
         state.paid_done_ids.add(task.task_id)
@@ -563,6 +588,7 @@ class InteractiveOpBlock:
         if not state.incomplete_ids:
             state.completed = True
             state.access_allowed = True
+        self._notify_completed(state)
 
     # ------------------------------------------------------------------
     # Клавиатура и текст
@@ -852,6 +878,7 @@ class InteractiveOpBlock:
                     "message_id": s.message_id,
                     "expires_at": s.expires_at.isoformat() if s.expires_at else None,
                     "completed": s.completed,
+                    "completion_notified": s.completion_notified,
                     "access_allowed": s.access_allowed,
                     "shown_marked": s.shown_marked,
                     "tasks": [_task_to_dict(t) for t in s.tasks.values()],
@@ -876,6 +903,10 @@ class InteractiveOpBlock:
                     incomplete_ids={int(i) for i in block.get("incomplete_ids") or []},
                     paid_done_ids={int(i) for i in block.get("paid_done_ids") or []},
                     completed=bool(block.get("completed")),
+                    # Дампы без флага (первые версии 1.3.2): False —
+                    # completion, случившийся в простое бота, будет
+                    # доставлен один раз при resume.
+                    completion_notified=bool(block.get("completion_notified", False)),
                     access_allowed=bool(block.get("access_allowed")),
                     shown_marked=bool(block.get("shown_marked", True)),
                 )
@@ -948,10 +979,18 @@ class InteractiveOpBlock:
 
     @staticmethod
     def _sync_interval(state: _BlockState, now: float) -> float | None:
+        """Интервал синхронизации по давности последнего действия.
+
+        Фазы: 2с → 5с → 15с, далее редкий idle-poll (120с) до expiry
+        сессии. None — только после аварийного giveup (2ч без событий)
+        либо когда цикл должен остановиться по completed/expired.
+        """
         idle = now - state.last_activity_mono
         for limit, interval in _SYNC_PHASES:
             if idle < limit:
                 return interval
+        if idle < _SYNC_IDLE_GIVEUP:
+            return _SYNC_IDLE_INTERVAL
         return None
 
     async def _sync_loop(self) -> None:
@@ -989,7 +1028,8 @@ class InteractiveOpBlock:
             if self._sync_batch_supported:
                 batch = due[:_SYNC_BATCH]
                 for state in batch:
-                    state.next_sync_mono = now + (self._sync_interval(state, now) or 15.0)
+                    interval = self._sync_interval(state, now) or 15.0
+                    state.next_sync_mono = now + self._jittered(interval)
                 try:
                     response = await self._client.sync_sessions([s.op_session_id for s in batch])
                 except NotFoundError:
@@ -1025,8 +1065,8 @@ class InteractiveOpBlock:
     async def _sync_individually(self, states: list[_BlockState]) -> None:
         now = time.monotonic()
         for state in states:
-            state.next_sync_mono = now + max(
-                self._sync_interval(state, now) or 15.0, _SYNC_FALLBACK_MIN_INTERVAL)
+            base = max(self._sync_interval(state, now) or 15.0, _SYNC_FALLBACK_MIN_INTERVAL)
+            state.next_sync_mono = now + self._jittered(base)
             try:
                 status = await self._client.get_session_status(state.op_session_id)
             except RateLimitError:
@@ -1042,10 +1082,18 @@ class InteractiveOpBlock:
             ):
                 self._spawn(state, self._render(state))
 
+    @staticmethod
+    def _jittered(interval: float) -> float:
+        return interval * random.uniform(1.0 - _SYNC_JITTER, 1.0 + _SYNC_JITTER)
+
     def _sync_backoff(self, exc: BaseException, *, base: float, cap: float) -> None:
         self._report("sync", exc)
         self._sync_failures += 1
         delay = min(cap, base * (2 ** (self._sync_failures - 1)))
+        # Серверный Retry-After (429) — авторитетный минимум паузы.
+        hint = getattr(exc, "retry_after", None)
+        if hint:
+            delay = max(delay, float(hint))
         self._sync_pause_until = time.monotonic() + delay
 
     def _apply_snapshot(
@@ -1069,7 +1117,26 @@ class InteractiveOpBlock:
         state.completed = state.access_allowed or not state.incomplete_ids
         if state.completed or session_status in ("expired", "failed"):
             state.sync_active = False
+        self._notify_completed(state)
         return before != (frozenset(state.incomplete_ids), state.completed)
+
+    def _notify_completed(self, state: _BlockState) -> None:
+        """Exactly-once completion event партнёра: срабатывает при первом
+        переходе сессии в completed из любого пути обнаружения."""
+        if not state.completed or state.completion_notified:
+            return
+        state.completion_notified = True
+        if self._on_completed is None:
+            return
+        self._spawn(state, self._run_completed(state))
+
+    async def _run_completed(self, state: _BlockState) -> None:
+        try:
+            result = self._on_completed(state.telegram_user_id, state.op_session_id)  # type: ignore[misc]
+            if inspect.isawaitable(result):
+                await result
+        except Exception as exc:  # noqa: BLE001 — hook партнёра не ломает OP
+            self._report("on_completed", exc)
 
     def _prune_states(self) -> None:
         """Удалить давно истёкшие блоки — без роста памяти у долгоживущего бота."""

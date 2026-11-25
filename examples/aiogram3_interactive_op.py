@@ -93,6 +93,20 @@ async def tg_delete(chat_id: int, message_id: int) -> None:
     await bot.delete_message(chat_id=chat_id, message_id=message_id)
 
 
+async def on_op_completed(telegram_user_id: int, op_session_id: int) -> None:
+    # SDK ≥1.3.2: completion event — все задания подтверждены, доступ
+    # открыт. Вызывается РОВНО один раз на сессию (в т.ч. один раз при
+    # resume, если completion случился, пока бот был выключен). Здесь —
+    # продолжение исходного сценария пользователя без повторного /start:
+    # например, запуск обработки ссылки, ради которой показывался ОП.
+    # Важно: именно ОТСЮДА, а не из повторной команды пользователя.
+    await bot.send_message(
+        telegram_user_id,
+        "Спасибо! Все задания выполнены — продолжаю обработку вашего запроса…",
+    )
+    # TODO: retrieve_pending_request(telegram_user_id) и продолжить сценарий.
+
+
 block = InteractiveOpBlock(
     ads,
     send_message=tg_send,
@@ -100,6 +114,7 @@ block = InteractiveOpBlock(
     edit_text=tg_edit_text,
     delete_message=tg_delete,
     slot_ttl_seconds=15.0,
+    on_completed=on_op_completed,
     # SDK ≥1.3.2: фоновая синхронизация включена по умолчанию —
     # выполненные слоты исчезают без «Проверить» и повторного /start.
     # auto_sync=False возвращает поведение 1.3.1.
