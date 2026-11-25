@@ -863,3 +863,39 @@ async def test_server_done_ids_survive_dump_restore(client: PastuhAdsClient, tg:
     assert 12 in state.server_done_ids
     assert 12 not in state.incomplete_ids
     await client.aclose()
+
+
+@respx.mock
+async def test_retired_block_render_never_rebuilds_keyboard(client: PastuhAdsClient, tg: FakeTelegram):
+    """Race regression: in-flight sync/retry, применённый ПОСЛЕ вытеснения,
+    не перестраивает клавиатуру осиротевшего сообщения — retired-флаг
+    закрывает все render-пути."""
+    respx.post(f"{BASE}/op-list").mock(side_effect=[
+        httpx.Response(200, json=_op_list_payload([
+            _task(11, "subscription_confirmed", url="https://t.me/chan_a"),
+        ], session_id=77)),
+        httpx.Response(200, json=_op_list_payload([
+            _task(21, "subscription_confirmed", url="https://t.me/chan_b"),
+        ], session_id=88)),
+    ])
+    respx.post(f"{BASE}/op-sessions/77/shown").mock(return_value=httpx.Response(
+        200, json={"status": "ok", "op_session_id": 77, "session_status": "shown"}))
+    respx.post(f"{BASE}/op-sessions/88/shown").mock(return_value=httpx.Response(
+        200, json={"status": "ok", "op_session_id": 88, "session_status": "shown"}))
+
+    block = make_block(client, tg)
+    mid1 = await block.open(UID, CHAT)
+    await block.open(UID, CHAT)  # supersede → retire mid1
+    assert tg.edits[-1] == (CHAT, mid1, [])
+    edits_count = len(tg.edits) + len(tg.text_edits)
+
+    # Прямая эмуляция запоздалого render/resend вытесненного state: no-op.
+    from pastuh_ads.interactive import _BlockState
+    stale = _BlockState(op_session_id=77, telegram_user_id=UID, chat_id=CHAT,
+                        message_id=mid1, retired=True)
+    await block._render(stale)
+    await block._resend(stale)
+    await client.aclose()
+
+    assert len(tg.edits) + len(tg.text_edits) == edits_count  # ни одной записи после retire
+    assert len(tg.sent) == 2  # resend тоже заблокирован

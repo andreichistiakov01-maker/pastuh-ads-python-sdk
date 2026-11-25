@@ -166,6 +166,9 @@ class _BlockState:
     # переход в complete терминален (taskGrantsAccess монотонен), поэтому
     # повторного появления быть не должно даже при гонке stale-ответов.
     server_done_ids: set[int] = field(default_factory=set)
+    # Вытесненный блок: render/resend полностью закрыт — ни один in-flight
+    # sync/retry не перестроит клавиатуру после снятия (race-proof).
+    retired: bool = False
     rev: int = 0
     slot_ref: tuple[int, int] | None = None  # (chat_id, message_id)
     shown_marked: bool = False
@@ -284,6 +287,8 @@ class InteractiveOpBlock:
         edit_text может быть не подключён партнёром, а пустая клавиатура
         уже исключает нажатия.
         """
+        state.retired = True
+        state.sync_active = False
         if state.reconcile_task is not None and not state.reconcile_task.done():
             state.reconcile_task.cancel()
         if state.message_id is None:
@@ -694,6 +699,9 @@ class InteractiveOpBlock:
         не устарела: конкурирующий рендер с большей rev подавляет наш —
         последняя запись всегда отражает самое свежее состояние.
         """
+        if state.retired:
+            return  # вытесненный блок: клавиатура не перестраивается никогда
+
         async with state.lock:
             state.rev += 1
             rev = state.rev
@@ -731,6 +739,8 @@ class InteractiveOpBlock:
         await self._ensure_shown(state)
 
     async def _resend(self, state: _BlockState) -> None:
+        if state.retired:
+            return
         async with state.lock:
             state.rev += 1
             rev = state.rev
