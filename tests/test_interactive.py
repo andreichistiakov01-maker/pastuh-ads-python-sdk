@@ -180,7 +180,7 @@ async def test_open_sends_single_message_with_buttons(client: PastuhAdsClient, t
         _task(11, "subscription_confirmed", url="https://t.me/chan_a", button="Открыть канал"),
         _task(12, "bot_tracked_click", slot=2, url="https://x.test/r/abc",
               target_url="https://t.me/paid_bot?start=pa_12", open_mode="callback",
-              username="paid_bot", button="Открыть бота"),
+              username="paid_bot", button="Запустить бота"),
     ])))
     respx.post(f"{BASE}/op-sessions/77/shown").mock(
         return_value=httpx.Response(200, json={"status": "ok", "op_session_id": 77, "session_status": "shown"}))
@@ -194,7 +194,7 @@ async def test_open_sends_single_message_with_buttons(client: PastuhAdsClient, t
     buttons = tg.flat_buttons(tg.sent[0][3])
     # Подписка — прямой url в один тап; tracked — callback-кнопка.
     sub = next(b for b in buttons if b["text"] == "Открыть канал")
-    paid = next(b for b in buttons if b["text"] == "Открыть бота")
+    paid = next(b for b in buttons if b["text"] == "Запустить бота")
     assert sub.get("url") == "https://t.me/chan_a" and "callback_data" not in sub
     assert paid.get("callback_data") == "paop:open:12" and "url" not in paid
     # UX v2: кнопки «Проверить» нет — проверка event-driven (server
@@ -297,16 +297,18 @@ async def test_paid_click_sends_ttl_slot_and_removes_button(client: PastuhAdsCli
     assert click.called
 
     # Слот с прямой t.me-ссылкой отправлен отдельным сообщением —
-    # текст и кнопка по макету: имя бота в призыве.
+    # OP V2: нейтральные текст и подпись, имени бота нет.
     slot_msg = tg.sent[-1]
-    assert slot_msg[2] == "Перейдите в @paid_bot и нажмите «Запустить»."
+    assert slot_msg[2] == "Перейдите по кнопке и нажмите «Запустить»."
     assert tg.flat_buttons(slot_msg[3])[0]["url"] == "https://t.me/paid_bot?start=pa_12"
-    assert tg.flat_buttons(slot_msg[3])[0]["text"] == "Перейти в @paid_bot"
+    assert tg.flat_buttons(slot_msg[3])[0]["text"] == "Запустить бота"
 
     # Основная клавиатура обновлена: задания больше нет, reopen-CTA есть.
     buttons = tg.flat_buttons()
     assert not any(b.get("callback_data") == "paop:open:12" for b in buttons)
     assert any(b.get("callback_data") == "paop:reopen:12" for b in buttons)
+    assert any(b.get("text") == "🔁 Запустить бота" for b in buttons)
+    assert not any("paid_bot" in (b.get("text") or "") for b in buttons)
 
     await asyncio.sleep(0.08)  # TTL 50мс
     assert (CHAT, slot_msg[1]) in tg.deleted

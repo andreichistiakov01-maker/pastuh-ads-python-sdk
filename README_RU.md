@@ -192,7 +192,7 @@ await client.register_click(task.task_id, telegram_user_id=user_id)
 ## 9.5. Callback-CTA для bot_tracked_click (SDK ≥1.1)
 
 `bot_tracked_click` — tokenless-задание, где оплачиваемое событие —
-первое подтверждённое нажатие кнопки «Открыть бота» в вашем OP, а не
+первое подтверждённое нажатие кнопки «Запустить бота» в вашем OP, а не
 сам переход в рекламируемый бот.
 
 Два режима ответа `op-list`:
@@ -200,7 +200,7 @@ await client.register_click(task.task_id, telegram_user_id=user_id)
 | `task.open_mode` | Что делать |
 |---|---|
 | `"url"` (по умолчанию) | Покажите обычную url-кнопку на `task.url` (server-hop `/r/{token}`) — как раньше. |
-| `"callback"` | Покажите callback-кнопку `task.cta_callback_data`; по callback_query вызовите `register_callback_click`, ответьте на callback **без** `url` и отправьте сообщение с нативной url-кнопкой «Перейти в бота» на `result.target_url`. |
+| `"callback"` | Покажите callback-кнопку `task.cta_callback_data`; по callback_query вызовите `register_callback_click`, ответьте на callback **без** `url` и отправьте сообщение с нативной url-кнопкой «Запустить бота» на `result.target_url`. |
 
 Чтобы сервер вернул `open_mode="callback"`, задекларируйте
 capability при запросе op-list:
@@ -222,7 +222,7 @@ async def on_open(callback):
     await callback.message.answer(
         "После выполнения нажмите «Проверить».",
         reply_markup=InlineKeyboardMarkup(inline_keyboard=[[
-            InlineKeyboardButton(text="Перейти в бота", url=result.target_url),
+            InlineKeyboardButton(text="Запустить бота", url=result.target_url),
         ]]))
 ```
 
@@ -234,7 +234,7 @@ async def on_open(callback):
 
 `InteractiveOpBlock` — готовый движок «одного OP-сообщения»: клавиатура
 сокращается по мере выполнения, tokenless-destination живёт во временном
-слоте (~15 с) и переоткрывается кнопкой «🔁 Открыть @bot» без повторной
+слоте (~15 с) и переоткрывается кнопкой «🔁 Запустить бота» без повторной
 оплаты.
 
 ```python

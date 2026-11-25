@@ -96,8 +96,8 @@ _REOPENABLE_ACTIONS = _PAID_CALLBACK_ACTIONS
 
 _MAIN_TEXT = "Чтобы продолжить, подпишитесь на ресурсы."
 _COMPLETED_TEXT = "🎉 Все задания выполнены. Доступ открыт!"
-_SLOT_TEXT_FALLBACK = "Нажмите кнопку ниже, чтобы перейти:"
-_SLOT_BUTTON_TEXT = "Перейти"
+_SLOT_TEXT = "Перейдите по кнопке и нажмите «Запустить»."
+_SLOT_BUTTON_TEXT = "Запустить бота"
 _MAX_BUTTON_TEXT = 64  # лимит подписи inline-кнопки Telegram, байт
 
 CB_OPEN = "paop:open:"
@@ -580,9 +580,9 @@ class InteractiveOpBlock:
                 continue
             if state.destination_url(task) is None:
                 continue
-            label = f"@{task.username}" if task.username else (task.title or "бота")
+            # Нейтральная подпись: имя/username ресурса не показываем.
             rows.append([{
-                "text": _clip(f"🔁 Открыть {label}"),
+                "text": "🔁 Запустить бота",
                 "callback_data": f"{CB_REOPEN}{task.task_id}",
             }])
         return rows
@@ -699,17 +699,11 @@ class InteractiveOpBlock:
         if url is None:
             return False
 
-        # Макет-эквивалент: слот зовёт по имени бота, когда оно известно —
-        # «Перейдите в @bot и нажмите «Запустить».» / «Перейти в @bot».
-        username = (task.username or "").lstrip("@")
-        text = (
-            f"Перейдите в @{username} и нажмите «Запустить»."
-            if username else _SLOT_TEXT_FALLBACK
-        )
-        label = _clip(f"Перейти в @{username}" if username else _SLOT_BUTTON_TEXT)
-        keyboard = [[{"text": label, "url": url}]]
+        # OP V2: нейтральный слот — имя бота не влияет на решение.
+        # Маршрутизация остаётся уникальной по URL (token в ссылке).
+        keyboard = [[{"text": _SLOT_BUTTON_TEXT, "url": url}]]
         try:
-            message_id = await self._send(state.chat_id, text, keyboard)
+            message_id = await self._send(state.chat_id, _SLOT_TEXT, keyboard)
         except Exception as exc:  # noqa: BLE001
             self._report("slot.send", exc)
             return False
