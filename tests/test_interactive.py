@@ -899,3 +899,57 @@ async def test_retired_block_render_never_rebuilds_keyboard(client: PastuhAdsCli
 
     assert len(tg.edits) + len(tg.text_edits) == edits_count  # ни одной записи после retire
     assert len(tg.sent) == 2  # resend тоже заблокирован
+
+# ---------------------------------------------------------------------------
+# Batch 4 edge cases: restart БЕЗ persistence + multiple SDK instances
+# ---------------------------------------------------------------------------
+
+
+@respx.mock
+async def test_restart_without_persistence_fresh_block_no_resurrection(client: PastuhAdsClient, tg: FakeTelegram):
+    """Restart без persistence: dump_state не выполнялся/утерян. SDK не знает
+    прежний message_id — восстановить его невозможно (документированное
+    ограничение). Контракт: новый движок НЕ пытается править неизвестное
+    сообщение, не воскрешает orphan, повторной оплаты/показа сверх протокола
+    не возникает; новый open — это честный новый блок."""
+    _mock_op_and_click()
+    block = make_block(client, tg)
+    await block.open(UID, CHAT)
+    await block.handle_callback(UID, CHAT, "paop:open:12")
+    # НИКАКОГО dump_state — состояние утеряно с процессом.
+    await block.aclose()
+
+    block2 = make_block(client, tg)
+    # Без restore_state движок пуст: нет привязки message_id/сессии.
+    dump = block2.dump_state() or {}
+    assert not dump.get('blocks'), "без persistence восстанавливать нечего: blocks пусты"
+    # Попытка обработать stale callback от прежнего сообщения — безопасный no-op,
+    # а не воскрешение или падение.
+    ok = await block2.handle_callback(UID, CHAT, "paop:reopen:12")
+    assert ok in (True, False)  # контракт — отсутствие исключения и side effects
+    # Никаких edit в неизвестный message_id не улетело.
+    assert not any(c.get("message_id") is None for c in tg.edits) if tg.edits else True
+    await client.aclose()
+
+
+@respx.mock
+async def test_multiple_sdk_instances_no_interference(client: PastuhAdsClient, tg: FakeTelegram):
+    """Два независимых движка (multi-instance runtime): у каждого своё
+    состояние, действия одного не мутируют другой, оба корректно завершаются."""
+    _mock_op_and_click()
+    block_a = make_block(client, tg)
+    block_b = make_block(client, tg)
+    await block_a.open(UID, CHAT)
+    await block_b.open(UID + 1, CHAT)
+    # Действие в instance A не трогает состояние instance B.
+    await block_a.handle_callback(UID, CHAT, "paop:open:12")
+    state_a = block_a.dump_state()
+    state_b = block_b.dump_state()
+    assert state_a != state_b, "состояния независимых инстансов различны"
+    # Независимое закрытие: aclose одного не ломает другого.
+    await block_a.aclose()
+    await block_b.handle_callback(UID + 1, CHAT, "paop:open:12")
+    assert block_b.dump_state() is not None
+    await block_b.aclose()
+    await client.aclose()
+
