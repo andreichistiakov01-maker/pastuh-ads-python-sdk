@@ -166,6 +166,10 @@ class _BlockState:
     # переход в complete терминален (taskGrantsAccess монотонен), поэтому
     # повторного появления быть не должно даже при гонке stale-ответов.
     server_done_ids: set[int] = field(default_factory=set)
+    # Fallback-строки: settlement подтверждён, но answerCallbackQuery(url)
+    # не сработал — задача показывается прямой URL-кнопкой В ТОМ ЖЕ
+    # основном сообщении (не slot-сообщением) до expiry/completion.
+    url_fallback_ids: set[int] = field(default_factory=set)
     # Вытесненный блок: render/resend полностью закрыт — ни один in-flight
     # sync/retry не перестроит клавиатуру после снятия (race-proof).
     retired: bool = False
@@ -250,6 +254,8 @@ class InteractiveOpBlock:
         on_completed: Callable[[int, int], Any] | None = None,
         auto_sync: bool = True,
         sync_min_interval_seconds: float = 2.0,
+        single_message_ux: bool = True,
+        diagnostic_hook: Callable[[dict[str, Any]], None] | None = None,
     ) -> None:
         self._client = client
         self._send = send_message
@@ -264,6 +270,8 @@ class InteractiveOpBlock:
         self._on_completed = on_completed
         self._auto_sync = bool(auto_sync)
         self._sync_min_interval = float(sync_min_interval_seconds)
+        self._single_message_ux = bool(single_message_ux)
+        self._diagnostic_hook = diagnostic_hook
         self._sync_task: asyncio.Task | None = None
         self._sync_batch_supported = True
         self._sync_failures = 0
@@ -417,16 +425,18 @@ class InteractiveOpBlock:
         if state.chat_id != chat_id:
             await _answer(answer, "Это устаревшая клавиатура из другого диалога.")
             return True
+        self._diag("callback.received", state, data=data[:40])
 
         if data == CB_CHECK:
             await self._handle_check(state, answer)
             return True
 
         # Любой paop-callback — наблюдаемое событие пользователя:
-        # throttled /check до dispatch (подтверждённые сервером задания
-        # подтягиваются без кнопки «Проверить»). paop:check обработан
-        # выше — он сам и есть проверка.
-        await self._maybe_check(state)
+        # throttled /check запускаем В ФОНЕ — он не является частью
+        # critical path оплачиваемого перехода: settlement и render
+        # не зависят от его результата, а ожидание добавляло бы
+        # полный RTT Partner API к пользовательской задержке.
+        self._spawn(state, self._maybe_check_safe(state))
 
         # Действие пользователя — фоновая синхронизация в быстрой фазе.
         self._touch(state)
@@ -458,9 +468,12 @@ class InteractiveOpBlock:
 
         try:
             if task.action_type == "bot_tracked_click":
+                self._diag("open.api_start", state, task_id=task_id)
                 response = await self._client.register_callback_click(
                     task_id, state.telegram_user_id
                 )
+                self._diag("open.api_end", state, task_id=task_id,
+                           charged=getattr(response, "charged", None))
                 if response.target_url:
                     task.target_url = response.target_url
                 # charged=False — уже оплаченный клик: повторная оплаты
@@ -469,8 +482,19 @@ class InteractiveOpBlock:
             elif task.action_type == "bot_click":
                 # Существующий контракт click/verification: фиксируем
                 # клик, верификацию подхватывает status-синхронизация.
+                self._diag("open.api_start", state, task_id=task_id)
                 await self._client.register_click(task_id, state.telegram_user_id)
+                self._diag("open.api_end", state, task_id=task_id)
                 await self._sync_status(state, trigger_check=True)
+                if self._single_message_ux and task_id in state.incomplete_ids:
+                    # Верификация ещё не подтверждена — пользователю нужно
+                    # реально открыть бота: прямой url-answer вместо слота.
+                    # Кнопка остаётся в клавиатуре до server-side подтверждения.
+                    url = state.destination_url(task)
+                    if url is not None and answer is not None:
+                        await self._try_answer_url(answer, url, state, task)
+                    await self._render(state)
+                    return
             else:
                 await _answer(answer, "Для этого задания переход не требует подтверждения.")
                 return
@@ -485,9 +509,95 @@ class InteractiveOpBlock:
             await self._render(state)
             return
 
+        if self._single_message_ux:
+            if task.action_type == "bot_tracked_click":
+                await self._open_direct(state, task, answer)
+            else:
+                # bot_click, верифицированный до render (повторный тап и т.п.):
+                # пользователь уже в боте — слот не нужен, только перерисовка.
+                await self._render(state)
+            return
+
         if not await self._send_slot(state, task):
             await _answer(answer, "Ссылка временно недоступна — попробуйте ещё раз.")
         await self._render(state)
+
+    async def _open_direct(
+        self,
+        state: _BlockState,
+        task: OpTask,
+        answer: AnswerCallback | None,
+    ) -> None:
+        """Single-message UX: прямое открытие через answerCallbackQuery(url).
+
+        Settlement уже подтверждён сервером (first-click-wins, повтор
+        безопасен). Кнопка исчезает из основного сообщения — никаких
+        slot-сообщений и reopen-строк. answer(url) и render независимы:
+        выполняются параллельно — экономия одного Telegram RTT.
+
+        Если Telegram отклонил url-ответ либо callable партнёра не
+        поддерживает url — fallback: задача остаётся прямой URL-кнопкой
+        в том же основном сообщении (НЕ отдельным slot-сообщением).
+        """
+        url = state.destination_url(task)
+
+        # answer(url) и render независимы: render удаляет кнопку из
+        # клавиатуры, answer открывает целевой бот. Запускаем параллельно —
+        # экономия одного Telegram RTT на happy path. Render оптимистичен
+        # (без fallback-строки): если answer отклонён — редкий путь —
+        # добавляем fallback-id и рендерим повторно; rev-fencing гарантирует,
+        # что финальная клавиатура отражает последнее состояние.
+        async def _answer_side() -> bool:
+            if url is None or answer is None:
+                return False
+            return await self._try_answer_url(answer, url, state, task)
+
+        answer_task = asyncio.ensure_future(_answer_side())
+        render_task = asyncio.ensure_future(self._render(state))
+        results = await asyncio.gather(answer_task, render_task, return_exceptions=True)
+        url_answered = results[0] is True
+
+        if url is not None and not url_answered:
+            async with state.lock:
+                state.url_fallback_ids.add(task.task_id)
+            await self._render(state)
+
+        self._diag("open.settled", state, task_id=task.task_id,
+                   url_answered=url_answered, fallback=url is not None and not url_answered)
+
+    async def _try_answer_url(
+        self,
+        answer: AnswerCallback,
+        url: str,
+        state: _BlockState,
+        task: OpTask,
+    ) -> bool:
+        """answerCallbackQuery(url=...) — прямое открытие целевого бота.
+
+        Bot API: url открывается клиентом пользователя; для t.me-ссылок
+        — нативный переход без браузера. Официально документировано для
+        ссылок вида t.me/your_bot?start=... — поведение для third-party
+        ботов подтверждается real-device QA (см. changelog 1.3.4).
+        Возвращает False если callable не принимает url или Telegram
+        отклонил запрос — вызывающий код включает fallback.
+        """
+        self._diag("answer_url.start", state, task_id=task.task_id)
+        try:
+            result = answer(url=url)  # type: ignore[call-arg]
+            if inspect.isawaitable(result):
+                await result
+        except TypeError:
+            # callable партнёра не принимает kwarg url — старая интеграция
+            self._diag("answer_url.unsupported", state, task_id=task.task_id)
+            return False
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:  # noqa: BLE001 — Telegram rejection
+            self._report("answer_url", exc)
+            self._diag("answer_url.rejected", state, task_id=task.task_id)
+            return False
+        self._diag("answer_url.ok", state, task_id=task.task_id)
+        return True
 
     async def _handle_reopen(
         self,
@@ -633,9 +743,15 @@ class InteractiveOpBlock:
         ordered = sorted(state.tasks.values(), key=lambda t: (t.slot, t.task_id))
 
         if state.completed:
-            # Completion: текст «Доступ открыт», только reopen-CTA —
-            # главное сообщение НЕ удаляется.
-            rows.extend(self._reopen_rows(state, ordered))
+            # Completion: текст «Доступ открыт». В single-message UX
+            # reopen-CTA не существует (целевой бот уже открыт нативно
+            # при тапе) — но fallback URL-строки сохраняются: settlement
+            # подтверждён, а пользователь ещё не попал в бот. Legacy —
+            # reopen-CTA.
+            if self._single_message_ux:
+                rows.extend(self._url_fallback_rows(state, ordered))
+            else:
+                rows.extend(self._reopen_rows(state, ordered))
             return _COMPLETED_TEXT, rows
 
         for task in ordered:
@@ -645,7 +761,10 @@ class InteractiveOpBlock:
             if button is not None:
                 rows.append([button])
 
-        rows.extend(self._reopen_rows(state, ordered))
+        if self._single_message_ux:
+            rows.extend(self._url_fallback_rows(state, ordered))
+        else:
+            rows.extend(self._reopen_rows(state, ordered))
         # UX-контракт v2: кнопки «Проверить выполнение» нет — проверка
         # event-driven (server events → /check piggyback на событиях
         # пользователя → опциональный reconcile-цикл). paop:check из
@@ -687,6 +806,29 @@ class InteractiveOpBlock:
             }])
         return rows
 
+    def _url_fallback_rows(
+        self, state: _BlockState, ordered: list[OpTask]
+    ) -> list[list[dict[str, str]]]:
+        """Прямые URL-кнопки В ОСНОВНОМ сообщении для задач, где settlement
+        подтверждён, но answerCallbackQuery(url) не сработал.
+
+        Это НЕ reopen-строки и НЕ slot-сообщения: кнопка — прямая
+        t.me-ссылка (один тап, нативное открытие), живёт в том же
+        OP-сообщении до completion/expiry. Только для задач, чей
+        url-ответ реально отклонён — в штатном потоке список пуст.
+        """
+        rows: list[list[dict[str, str]]] = []
+        for task in ordered:
+            if task.task_id not in state.url_fallback_ids:
+                continue
+            if task.task_id in state.incomplete_ids:
+                continue
+            url = state.destination_url(task)
+            if url is None:
+                continue
+            rows.append([{"text": _clip(task.action_button_text or "Запустить бота"), "url": url}])
+        return rows
+
     # ------------------------------------------------------------------
     # Render с revision-fencing
     # ------------------------------------------------------------------
@@ -711,12 +853,14 @@ class InteractiveOpBlock:
         if message_id is None or rev != state.rev:
             return
 
+        self._diag("render.start", state, rev=rev)
         try:
             if state.completed and self._edit_text is not None:
                 await self._edit_text(state.chat_id, message_id, text, keyboard)
             else:
                 await self._edit_markup(state.chat_id, message_id, keyboard)
             state.render_failures = 0
+            self._diag("render.end", state, rev=rev)
         except Exception as exc:  # noqa: BLE001 — Telegram callables
             lowered = str(exc).lower()
             if "not modified" in lowered:
@@ -1208,6 +1352,39 @@ class InteractiveOpBlock:
             state.expires_at is not None
             and state.expires_at <= datetime.now(timezone.utc)
         )
+
+    async def _maybe_check_safe(self, state: _BlockState) -> None:
+        """Фоновый piggyback /check — изолирован от critical path."""
+        try:
+            await self._maybe_check(state)
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:  # noqa: BLE001 — фон, ошибки в метрики
+            self._report("maybe_check.bg", exc)
+
+    def _diag(self, event: str, state: _BlockState, **extra: Any) -> None:
+        """Diagnostic timing hook — monotonic clock, корреляция по сессии.
+
+        События: callback.received, open.api_start/api_end, answer_url.*,
+        render.start/end, settle.* — партнёр (Boom) подключает hook и
+        получает точный latency breakdown без переписки интеграции.
+        Исключения hook'а изолированы — не влияют на OP-механику.
+        """
+        hook = self._diagnostic_hook
+        if hook is None:
+            return
+        payload = {
+            "event": event,
+            "mono": time.monotonic(),
+            "op_session_id": state.op_session_id,
+            "telegram_user_id": state.telegram_user_id,
+            "message_id": state.message_id,
+            **extra,
+        }
+        try:
+            hook(payload)
+        except Exception:  # noqa: BLE001 — диагностика не ломает механику
+            pass
 
     def _report(self, context: str, exc: BaseException) -> None:
         # Логируем только тип ошибки — без chat_id/user_id payload.

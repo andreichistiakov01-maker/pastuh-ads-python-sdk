@@ -289,7 +289,7 @@ def _mock_op_and_click(charged: bool = True):
 @respx.mock
 async def test_paid_click_sends_ttl_slot_and_removes_button(client: PastuhAdsClient, tg: FakeTelegram):
     click = _mock_op_and_click()
-    block = make_block(client, tg)
+    block = make_block(client, tg, single_message_ux=False)
     await block.open(UID, CHAT)
 
     ok = await block.handle_callback(UID, CHAT, "paop:open:12")
@@ -318,7 +318,7 @@ async def test_paid_click_sends_ttl_slot_and_removes_button(client: PastuhAdsCli
 @respx.mock
 async def test_reopen_after_ttl_no_api_no_charge(client: PastuhAdsClient, tg: FakeTelegram):
     click = _mock_op_and_click()
-    block = make_block(client, tg)
+    block = make_block(client, tg, single_message_ux=False)
     await block.open(UID, CHAT)
     await block.handle_callback(UID, CHAT, "paop:open:12")
     await asyncio.sleep(0.08)  # слот истёк и удалён
@@ -365,7 +365,7 @@ async def test_reopen_rejects_incomplete_task_and_expired(client: PastuhAdsClien
     async def answer(text: str) -> None:
         answers.append(text)
 
-    block = make_block(client, tg)
+    block = make_block(client, tg, single_message_ux=False)
     await block.open(UID, CHAT)
 
     # Reopen по НЕвыполненному заданию — слота нет, только перерисовка.
@@ -439,7 +439,7 @@ async def test_check_refreshes_keyboard_and_completes(client: PastuhAdsClient, t
                   open_mode="callback", username="paid_bot", status="confirmed"),
         ], incomplete=[], access=True)))
 
-    block = make_block(client, tg)
+    block = make_block(client, tg, single_message_ux=False)
     await block.open(UID, CHAT)
     await block.handle_callback(UID, CHAT, "paop:check")
     await client.aclose()
@@ -575,7 +575,7 @@ async def test_telegram_timeout_bounded_retry(client: PastuhAdsClient, tg: FakeT
 async def test_slot_delete_survives_newer_slot(client: PastuhAdsClient, tg: FakeTelegram):
     """Ref-match guard: TTL-job старого слота не удаляет новый."""
     _mock_op_and_click()
-    block = make_block(client, tg, slot_ttl_seconds=0.06)
+    block = make_block(client, tg, slot_ttl_seconds=0.06, single_message_ux=False)
     await block.open(UID, CHAT)
     await block.handle_callback(UID, CHAT, "paop:open:12")
     first_slot = tg.sent[-1][1]
@@ -599,7 +599,7 @@ async def test_slot_delete_survives_newer_slot(client: PastuhAdsClient, tg: Fake
 @respx.mock
 async def test_restart_restore_and_resume(client: PastuhAdsClient, tg: FakeTelegram):
     _mock_op_and_click()
-    block = make_block(client, tg)
+    block = make_block(client, tg, single_message_ux=False)
     await block.open(UID, CHAT)
     await block.handle_callback(UID, CHAT, "paop:open:12")
     snapshot = block.dump_state()
@@ -619,7 +619,7 @@ async def test_restart_restore_and_resume(client: PastuhAdsClient, tg: FakeTeleg
         ], incomplete=[], access=True)))
 
     # «Перезапуск процесса»: новый движок, тот же клиент и Telegram.
-    block2 = make_block(client, tg)
+    block2 = make_block(client, tg, single_message_ux=False)
     block2.restore_state(snapshot)
     await block2.resume()
 

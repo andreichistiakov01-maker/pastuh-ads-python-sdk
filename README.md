@@ -91,9 +91,17 @@ Callback-data бота:
 
 | data | Действие |
 |---|---|
-| `paop:open:{task_id}` | Оплачиваемый клик → серверная фиксация → TTL-слот |
-| `paop:reopen:{task_id}` | Повторное открытие оплаченного слота (без API) |
+| `paop:open:{task_id}` | Оплачиваемый клик → серверная фиксация → прямое открытие через `answerCallbackQuery(url)` (SDK ≥1.3.4); кнопка исчезает, дополнительных сообщений нет |
+| `paop:reopen:{task_id}` | legacy-клавиатуры SDK ≤1.3.3 — reopen оплаченного слота (в ≥1.3.4 reopen-строки не рендерятся) |
 | `paop:check` | legacy-клавиатуры SDK <1.3 → POST /check (в новой кнопки нет — проверка event-driven: throttled /check на событиях пользователя + bounded fallback) |
+
+**SDK ≥1.3.4 — single-message UX (default):** выполненные кнопки исчезают,
+slot-сообщения («Перейдите по кнопке…») и reopen-строки («🔁 Запустить бота»)
+не создаются. Целевой бот открывается нативно одним тапом — aiogram
+`callback.answer` поддерживает `url` из коробки, изменений интеграции
+не требуется. `single_message_ux=False` восстанавливает поведение 1.3.3.
+`diagnostic_hook=(lambda ev: logger.info(ev))` — коррелированная
+latency-диагностика (callback.received → api → answer_url → render).
 
 Готовый пример: [examples/aiogram3_interactive_op.py](examples/aiogram3_interactive_op.py).
 Без aiogram/SDK — голый aiohttp: [examples/aiohttp_interactive_op.py](examples/aiohttp_interactive_op.py).
