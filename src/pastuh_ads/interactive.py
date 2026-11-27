@@ -170,6 +170,10 @@ class _BlockState:
     # не сработал — задача показывается прямой URL-кнопкой В ТОМ ЖЕ
     # основном сообщении (не slot-сообщением) до expiry/completion.
     url_fallback_ids: set[int] = field(default_factory=set)
+    # Concurrent-tap guard: settlement задачи уже в полёте — второй
+    # одновременный тап не порождает дублирующий запрос (серверная
+    # идемпотентность charged=false остаётся последней линией).
+    open_inflight: set[int] = field(default_factory=set)
     # Вытесненный блок: render/resend полностью закрыт — ни один in-flight
     # sync/retry не перестроит клавиатуру после снятия (race-proof).
     retired: bool = False
@@ -465,7 +469,23 @@ class InteractiveOpBlock:
             await _answer(answer, "Задание уже выполнено или не найдено.")
             await self._render(state)
             return
+        if task_id in state.open_inflight:
+            await _answer(answer, "Переход уже обрабатывается…")
+            return
 
+        state.open_inflight.add(task_id)
+        try:
+            await self._handle_open_inner(state, task, task_id, answer)
+        finally:
+            state.open_inflight.discard(task_id)
+
+    async def _handle_open_inner(
+        self,
+        state: _BlockState,
+        task: OpTask,
+        task_id: int,
+        answer: AnswerCallback | None,
+    ) -> None:
         try:
             if task.action_type == "bot_tracked_click":
                 self._diag("open.api_start", state, task_id=task_id)
@@ -513,8 +533,8 @@ class InteractiveOpBlock:
             if task.action_type == "bot_tracked_click":
                 await self._open_direct(state, task, answer)
             else:
-                # bot_click, верифицированный до render (повторный тап и т.п.):
-                # пользователь уже в боте — слот не нужен, только перерисовка.
+                # bot_click, верифицированный до render (повторный тап):
+                # пользователь уже в боте — слот не нужен, перерисовка.
                 await self._render(state)
             return
 
@@ -1068,6 +1088,7 @@ class InteractiveOpBlock:
                     "incomplete_ids": sorted(s.incomplete_ids),
                     "paid_done_ids": sorted(s.paid_done_ids),
                     "server_done_ids": sorted(s.server_done_ids),
+                    "url_fallback_ids": sorted(s.url_fallback_ids),
                 }
                 for s in self._states.values()
             ],
@@ -1087,6 +1108,7 @@ class InteractiveOpBlock:
                     incomplete_ids={int(i) for i in block.get("incomplete_ids") or []},
                     paid_done_ids={int(i) for i in block.get("paid_done_ids") or []},
                     server_done_ids={int(i) for i in block.get("server_done_ids") or []},
+                    url_fallback_ids={int(i) for i in block.get("url_fallback_ids") or []},
                     completed=bool(block.get("completed")),
                     # Дампы без флага (первые версии 1.3.2): False —
                     # completion, случившийся в простое бота, будет

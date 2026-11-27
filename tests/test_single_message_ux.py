@@ -429,3 +429,77 @@ async def test_fewer_telegram_calls_than_legacy(client, tg):
     assert new_edits >= 1, "ровно редактирование основного сообщения"
     await block.aclose()
     await client.aclose()
+
+
+@respx.mock
+async def test_concurrent_taps_single_settlement_request(client, tg):
+    """J. Concurrent callbacks: два одновременных тапа по одной кнопке —
+    не более одного settlement-запроса (in-flight guard), оба корректно
+    обработаны, кнопка исчезает ровно один раз."""
+    respx.post(f"{BASE}/op-list").mock(return_value=httpx.Response(200, json=_op_list_payload([
+        _task(12, "bot_tracked_click", url="https://x.test/r/tok",
+              target_url="https://t.me/paid_bot?start=pa_12",
+              open_mode="callback", username="paid_bot"),
+    ])))
+    respx.post(f"{BASE}/op-sessions/77/shown").mock(
+        return_value=httpx.Response(200, json={"status": "ok", "op_session_id": 77}))
+
+    async def slow_settle(request):
+        await asyncio.sleep(0.15)
+        return httpx.Response(200, json={
+            "status": "ok", "task_id": 12, "task_status": "confirmed",
+            "verification_status": "confirmed", "charged": True,
+            "target_url": "https://t.me/paid_bot?start=pa_12"})
+    click = respx.post(f"{BASE}/tasks/12/callback-click").mock(side_effect=slow_settle)
+
+    block = make_block(client, tg)
+    await block.open(UID, CHAT)
+    answer = UrlAnswer()
+
+    # два конкурентных тапа в одном event loop
+    await asyncio.gather(
+        block.handle_callback(UID, CHAT, "paop:open:12", answer=answer),
+        block.handle_callback(UID, CHAT, "paop:open:12", answer=answer),
+    )
+    await asyncio.sleep(0.05)
+    assert click.call_count == 1, f"settlement запросов: {click.call_count}, ожидался 1"
+    assert not any("open:12" in (b.get("callback_data") or "") for b in tg.flat_buttons())
+    await block.aclose()
+    await client.aclose()
+
+
+@respx.mock
+async def test_restart_preserves_url_fallback_rows(client, tg):
+    """K. Restart recovery: fallback URL-строка переживает restart
+    (persistence) — пользователь не теряет оплаченный destination."""
+    _mock_op_and_click()
+    block = make_block(client, tg)
+    await block.open(UID, CHAT)
+    await block.handle_callback(UID, CHAT, "paop:open:12", answer=UrlAnswer(fail_url=True))
+    await asyncio.sleep(0.05)
+    assert any(b.get("url") == "https://t.me/paid_bot?start=pa_12" for b in tg.flat_buttons())
+
+    snapshot = block.dump_state()
+    await block.aclose()
+
+    respx.post(f"{BASE}/op-sessions/77/check").mock(return_value=httpx.Response(
+        200, json=_status_payload([
+            _task(12, "bot_tracked_click", url="https://x.test/r/tok",
+                  target_url="https://t.me/paid_bot?start=pa_12",
+                  open_mode="callback", status="confirmed"),
+        ], incomplete=[], access=True)))
+    respx.get(f"{BASE}/op-sessions/77/status").mock(return_value=httpx.Response(
+        200, json=_status_payload([
+            _task(12, "bot_tracked_click", url="https://x.test/r/tok",
+                  target_url="https://t.me/paid_bot?start=pa_12",
+                  open_mode="callback", status="confirmed"),
+        ], incomplete=[], access=True)))
+
+    block2 = make_block(client, tg)
+    block2.restore_state(snapshot)
+    await block2.resume()
+    await asyncio.sleep(0.05)
+    assert any(b.get("url") == "https://t.me/paid_bot?start=pa_12" for b in tg.flat_buttons()), \
+        "fallback-строка должна пережить restart"
+    await block2.aclose()
+    await client.aclose()
