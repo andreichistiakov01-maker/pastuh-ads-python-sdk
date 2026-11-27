@@ -88,18 +88,24 @@ async def test_paid_click_no_slot_message_no_reopen_rows(client, tg):
     assert len(tg.sent) == sent_before, "slot-сообщение не должно отправляться"
     assert all("Перейдите по кнопке" not in s[2] for s in tg.sent)
 
-    # 2. Клавиатура основного сообщения: ни reopen-строк, ни задания 12.
+    # 2. Клавиатура основного сообщения: ни reopen-строк, ни callback-кнопки
+    # задания 12 — она ТРАНСФОРМИРОВАЛАСЬ в прямую URL-кнопку (two-tap UX).
     buttons = tg.flat_buttons()
     assert not any("reopen" in (b.get("callback_data") or "") for b in buttons)
     assert not any(b.get("text") == "🔁 Запустить бота" for b in buttons)
     assert not any("open:12" in (b.get("callback_data") or "") for b in buttons)
+    dest = [b for b in buttons if b.get("url") == "https://t.me/paid_bot?start=pa_12"]
+    assert dest, "прямая URL-кнопка оплаченного destination в том же сообщении"
     await block.aclose()
     await client.aclose()
 
 
 @respx.mock
-async def test_answer_receives_tme_url(client, tg):
-    """answerCallbackQuery вызывается с url=target_url — прямое открытие."""
+async def test_answer_no_url_by_default_third_party_unsupported(client, tg):
+    """Официальное ограничение Telegram: callback url — только deep links
+    к собственному боту/игре. Third-party advertiser bot через url-answer
+    НЕ открывается — SDK не тратит RTT на заведомо отклоняемый вызов.
+    Вместо этого — toast и трансформация кнопки (two-tap UX)."""
     _mock_op_and_click()
     block = make_block(client, tg)
     await block.open(UID, CHAT)
@@ -109,9 +115,29 @@ async def test_answer_receives_tme_url(client, tg):
     await asyncio.sleep(0.05)
 
     url_calls = [c for c in answer.calls if c.get("url")]
-    assert url_calls, "answer должен быть вызван с url"
-    assert url_calls[0]["url"] == "https://t.me/paid_bot?start=pa_12"
-    assert url_calls[0]["url"].startswith("https://t.me/")
+    assert not url_calls, "url-answer для third-party не используется (официально запрещён)"
+    # пользователь получает понятный toast о двухтаповом сценарии
+    assert any("ещё раз" in (c.get("text") or "") for c in answer.calls)
+    await block.aclose()
+    await client.aclose()
+
+
+@respx.mock
+async def test_experimental_url_answer_flag_attempts_once(client, tg):
+    """Experimental opt-in: try_direct_url_answer=True — одна попытка
+    url-answer; при отказе Telegram клавиатура всё равно корректна."""
+    _mock_op_and_click()
+    block = make_block(client, tg, try_direct_url_answer=True)
+    await block.open(UID, CHAT)
+
+    answer = UrlAnswer(fail_url=True)  # Telegram отклоняет third-party url
+    await block.handle_callback(UID, CHAT, "paop:open:12", answer=answer)
+    await asyncio.sleep(0.05)
+
+    # отказ пережит: destination-строка на месте, toast выдан
+    buttons = tg.flat_buttons()
+    assert any(b.get("url") == "https://t.me/paid_bot?start=pa_12" for b in buttons)
+    assert any("ещё раз" in (c.get("text") or "") for c in answer.calls)
     await block.aclose()
     await client.aclose()
 
@@ -147,17 +173,33 @@ async def test_screenshot_scenario_two_bots_one_channel(client, tg):
     answer = UrlAnswer()
     await block.handle_callback(UID, CHAT, "paop:open:12", answer=answer)
     await asyncio.sleep(0.05)
-    # После первого выполнения: 2 кнопки (channel + bot13), ноль слотов.
+    # После первого выполнения: 3 строки — channel (невыполненная),
+    # ПОЗИЦИОННО трансформированная URL-кнопка бота, второй бот callback.
+    # Ноль слотов, ноль 🔁-строк, ноль новых сообщений.
     buttons = tg.flat_buttons()
-    assert len(buttons) == 2, f"ожидалось 2 кнопки, получено {len(buttons)}: {buttons}"
+    assert len(buttons) == 3, f"ожидалось 3 кнопки, получено {len(buttons)}: {buttons}"
     assert not any("🔁" in b.get("text", "") for b in buttons)
+    assert not any("open:12" in (b.get("callback_data") or "") for b in buttons)
+    # трансформация ПОЗИЦИОННАЯ: URL-кнопка бота1 — вторая строка (slot=2),
+    # не снизу и не новым сообщением
+    rows = tg.last_markup()
+    assert rows[1][0].get("url") == "https://t.me/bot_one?start=p12", \
+        f"URL-кнопка должна быть на исходной позиции slot=2: {rows}"
+    assert rows[0][0].get("url") == "https://t.me/chan_a"
+    assert "open:13" in (rows[2][0].get("callback_data") or "")
 
     await block.handle_callback(UID, CHAT, "paop:open:13", answer=answer)
     await asyncio.sleep(0.05)
-    # После второго: только «Открыть канал». Ноль новых сообщений.
+    # После второго: channel + две destination URL-строки на исходных
+    # позициях — оплаченные переходы НЕ уничтожаются (финансовая гарантия).
+    # Ноль новых сообщений за весь сценарий.
     buttons = tg.flat_buttons()
-    assert len(buttons) == 1
-    assert buttons[0].get("url") == "https://t.me/chan_a"
+    assert len(buttons) == 3
+    urls = [b.get("url") for b in buttons]
+    assert "https://t.me/chan_a" in urls
+    assert "https://t.me/bot_one?start=p12" in urls
+    assert "https://t.me/bot_two?start=p13" in urls
+    assert not any("callback_data" in b for b in buttons), "ни одной callback-кнопки не осталось"
     assert len(tg.sent) == sent_before, "ни одного slot-сообщения за весь сценарий"
     await block.aclose()
     await client.aclose()
@@ -230,7 +272,7 @@ async def test_diagnostic_hook_emits_latency_chain(client, tg):
     names = [e["event"] for e in events]
     assert "callback.received" in names
     assert "open.api_start" in names and "open.api_end" in names
-    assert "answer_url.ok" in names
+    assert "open.settled" in names
     assert "render.start" in names and "render.end" in names
     # monotonic возрастание внутри цепочки
     idx = {n: names.index(n) for n in ("callback.received", "open.api_start", "open.api_end")}
@@ -387,9 +429,11 @@ async def test_api_failure_button_stays_no_completion(client, tg):
 # ---------------------------------------------------------------------------
 
 @respx.mock
-async def test_completion_empty_keyboard_single_task(client, tg):
-    """Единственное задание выполнено → «Доступ открыт», клавиатура ПУСТАЯ —
-    никаких reopen-строк в финальном состоянии."""
+async def test_completion_preserves_destination_row_last_slot_safety(client, tg):
+    """LAST-SLOT SAFETY: единственное задание выполнено → completion,
+    но destination-строка СОХРАНЯЕТСЯ — settlement списал деньги при тапе,
+    а пользователь ещё не открывал бот. Completion не уничтожает последний
+    доступный переход. Никаких reopen-строк и слотов."""
     _mock_op_and_click()
     block = make_block(client, tg)
     await block.open(UID, CHAT)
@@ -397,7 +441,9 @@ async def test_completion_empty_keyboard_single_task(client, tg):
     await asyncio.sleep(0.05)
 
     buttons = tg.flat_buttons()
-    assert buttons == [], f"финальная клавиатура должна быть пустой: {buttons}"
+    assert len(buttons) == 1, f"при completion остаётся ровно destination-строка: {buttons}"
+    assert buttons[0].get("url") == "https://t.me/paid_bot?start=pa_12"
+    assert not any("reopen" in (b.get("callback_data") or "") for b in buttons)
     if tg.text_edits:
         assert "Доступ открыт" in tg.text_edits[-1][2]
     await block.aclose()
@@ -469,13 +515,54 @@ async def test_concurrent_taps_single_settlement_request(client, tg):
 
 
 @respx.mock
-async def test_restart_preserves_url_fallback_rows(client, tg):
-    """K. Restart recovery: fallback URL-строка переживает restart
-    (persistence) — пользователь не теряет оплаченный destination."""
+async def test_sync_does_not_remove_destination_row_prematurely(client, tg):
+    """Sync подтверждает задание серверно-выполненным — destination-строка
+    НЕ исчезает: пользователь ещё не открывал бот, доступ гарантирован."""
+    respx.post(f"{BASE}/op-list").mock(return_value=httpx.Response(200, json=_op_list_payload([
+        _task(11, "subscription_confirmed", slot=1, url="https://t.me/chan_a", button="Открыть канал"),
+        _task(12, "bot_tracked_click", slot=2, url="https://x.test/r/t1",
+              target_url="https://t.me/bot_one?start=p1", open_mode="callback", button="Запустить бота"),
+    ])))
+    respx.post(f"{BASE}/op-sessions/77/shown").mock(
+        return_value=httpx.Response(200, json={"status": "ok", "op_session_id": 77}))
+    respx.post(f"{BASE}/tasks/12/callback-click").mock(
+        return_value=httpx.Response(200, json={
+            "status": "ok", "task_id": 12, "task_status": "confirmed",
+            "verification_status": "confirmed", "charged": True,
+            "target_url": "https://t.me/bot_one?start=p1"}))
+    respx.post(f"{BASE}/op-sessions/77/check").mock(return_value=httpx.Response(
+        200, json=_status_payload([
+            _task(11, "subscription_confirmed", slot=1, url="https://t.me/chan_a"),
+            _task(12, "bot_tracked_click", slot=2, url="https://x.test/r/t1",
+                  target_url="https://t.me/bot_one?start=p1", open_mode="callback", status="confirmed"),
+        ], incomplete=[11])))
+
+    block = make_block(client, tg)
+    await block.open(UID, CHAT)
+    await block.handle_callback(UID, CHAT, "paop:open:12", answer=UrlAnswer())
+    await asyncio.sleep(0.05)
+    assert any(b.get("url") == "https://t.me/bot_one?start=p1" for b in tg.flat_buttons())
+
+    # sync/check подтверждает завершение — строка остаётся
+    await block._states[UID].lock.acquire()
+    block._states[UID].lock.release()
+    await block._sync_status(block._states[UID], trigger_check=True)
+    await block._render(block._states[UID])
+    buttons = tg.flat_buttons()
+    assert any(b.get("url") == "https://t.me/bot_one?start=p1" for b in buttons), "sync не должен удалять destination-строку"
+    assert len(tg.sent) == 1, "ни одного нового сообщения за весь жизненный цикл"
+    await block.aclose()
+    await client.aclose()
+
+
+@respx.mock
+async def test_restart_preserves_destination_rows(client, tg):
+    """K. Restart recovery: destination-строка переживает restart —
+    пользователь не теряет оплаченный переход при перезапуске бота."""
     _mock_op_and_click()
     block = make_block(client, tg)
     await block.open(UID, CHAT)
-    await block.handle_callback(UID, CHAT, "paop:open:12", answer=UrlAnswer(fail_url=True))
+    await block.handle_callback(UID, CHAT, "paop:open:12", answer=UrlAnswer())
     await asyncio.sleep(0.05)
     assert any(b.get("url") == "https://t.me/paid_bot?start=pa_12" for b in tg.flat_buttons())
 
@@ -499,7 +586,6 @@ async def test_restart_preserves_url_fallback_rows(client, tg):
     block2.restore_state(snapshot)
     await block2.resume()
     await asyncio.sleep(0.05)
-    assert any(b.get("url") == "https://t.me/paid_bot?start=pa_12" for b in tg.flat_buttons()), \
-        "fallback-строка должна пережить restart"
+    assert any(b.get("url") == "https://t.me/paid_bot?start=pa_12" for b in tg.flat_buttons()), "destination-строка должна пережить restart"
     await block2.aclose()
     await client.aclose()

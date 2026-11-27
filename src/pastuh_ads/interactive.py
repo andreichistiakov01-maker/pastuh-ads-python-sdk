@@ -166,10 +166,14 @@ class _BlockState:
     # переход в complete терминален (taskGrantsAccess монотонен), поэтому
     # повторного появления быть не должно даже при гонке stale-ответов.
     server_done_ids: set[int] = field(default_factory=set)
-    # Fallback-строки: settlement подтверждён, но answerCallbackQuery(url)
-    # не сработал — задача показывается прямой URL-кнопкой В ТОМ ЖЕ
-    # основном сообщении (не slot-сообщением) до expiry/completion.
-    url_fallback_ids: set[int] = field(default_factory=set)
+    # Destination-строки: settlement подтверждён — задача показывается
+    # прямой URL-кнопкой В ТОМ ЖЕ сообщении на ИСХОДНОЙ позиции до expiry.
+    # НЕ удаляется sync/completion: деньги списаны в момент тапа, а бот
+    # пользователем ещё не открыт — доступ к оплаченному destination
+    # гарантирован финансовым контрактом. (answerCallbackQuery url для
+    # third-party ботов официально не поддерживается Telegram — прямое
+    # открытие невозможно, два нажатия зафиксированы честно.)
+    destination_ids: set[int] = field(default_factory=set)
     # Concurrent-tap guard: settlement задачи уже в полёте — второй
     # одновременный тап не порождает дублирующий запрос (серверная
     # идемпотентность charged=false остаётся последней линией).
@@ -260,6 +264,7 @@ class InteractiveOpBlock:
         sync_min_interval_seconds: float = 2.0,
         single_message_ux: bool = True,
         diagnostic_hook: Callable[[dict[str, Any]], None] | None = None,
+        try_direct_url_answer: bool = False,
     ) -> None:
         self._client = client
         self._send = send_message
@@ -276,6 +281,10 @@ class InteractiveOpBlock:
         self._sync_min_interval = float(sync_min_interval_seconds)
         self._single_message_ux = bool(single_message_ux)
         self._diagnostic_hook = diagnostic_hook
+        # Experimental: answerCallbackQuery(url) для third-party advertiser
+        # bots официально НЕ поддерживается Telegram (deep links только к
+        # собственному боту/игре). False — transform-only UX (два тапа).
+        self._try_direct_url_answer = bool(try_direct_url_answer)
         self._sync_task: asyncio.Task | None = None
         self._sync_batch_supported = True
         self._sync_failures = 0
@@ -508,11 +517,15 @@ class InteractiveOpBlock:
                 await self._sync_status(state, trigger_check=True)
                 if self._single_message_ux and task_id in state.incomplete_ids:
                     # Верификация ещё не подтверждена — пользователю нужно
-                    # реально открыть бота: прямой url-answer вместо слота.
-                    # Кнопка остаётся в клавиатуре до server-side подтверждения.
+                    # реально открыть бота: строка трансформируется в прямую
+                    # URL-кнопку на месте. После server-side верификации
+                    # она исчезнет (доступ уже получен — см. _complete_task).
                     url = state.destination_url(task)
-                    if url is not None and answer is not None:
-                        await self._try_answer_url(answer, url, state, task)
+                    if url is not None:
+                        async with state.lock:
+                            state.destination_ids.add(task.task_id)
+                    if answer is not None:
+                        await _answer(answer, "Нажмите кнопку ещё раз, чтобы открыть бота.")
                     await self._render(state)
                     return
             else:
@@ -548,42 +561,43 @@ class InteractiveOpBlock:
         task: OpTask,
         answer: AnswerCallback | None,
     ) -> None:
-        """Single-message UX: прямое открытие через answerCallbackQuery(url).
+        """Single-message UX: кнопка ТРАНСФОРМИРУЕТСЯ в прямую URL-кнопку
+        на исходной позиции того же сообщения.
+
+        Официальное ограничение Telegram: answerCallbackQuery(url) принимает
+        только deep links к СОБСТВЕННОМУ боту или его игре — third-party
+        advertiser bot открыть через callback answer нельзя. Поэтому UX
+        честно двухтаповый: (1) тап по callback-кнопке — settlement,
+        кнопка становится прямой t.me-ссылкой на месте; (2) тап по ней —
+        нативное открытие рекламируемого бота. Никаких slot-сообщений,
+        reopen-строк и воскрешений. Destination-строка живёт до expiry —
+        деньги списаны при первом тапе, доступ гарантирован.
 
         Settlement уже подтверждён сервером (first-click-wins, повтор
-        безопасен). Кнопка исчезает из основного сообщения — никаких
-        slot-сообщений и reopen-строк. answer(url) и render независимы:
-        выполняются параллельно — экономия одного Telegram RTT.
-
-        Если Telegram отклонил url-ответ либо callable партнёра не
-        поддерживает url — fallback: задача остаётся прямой URL-кнопкой
-        в том же основном сообщении (НЕ отдельным slot-сообщением).
+        безопасен). answer-toast и render независимы — параллельно.
         """
         url = state.destination_url(task)
+        if url is not None:
+            async with state.lock:
+                state.destination_ids.add(task.task_id)
 
-        # answer(url) и render независимы: render удаляет кнопку из
-        # клавиатуры, answer открывает целевой бот. Запускаем параллельно —
-        # экономия одного Telegram RTT на happy path. Render оптимистичен
-        # (без fallback-строки): если answer отклонён — редкий путь —
-        # добавляем fallback-id и рендерим повторно; rev-fencing гарантирует,
-        # что финальная клавиатура отражает последнее состояние.
-        async def _answer_side() -> bool:
-            if url is None or answer is None:
-                return False
-            return await self._try_answer_url(answer, url, state, task)
+        # Experimental: прямой url-answer выключен по умолчанию — third-party
+        # официально не поддерживается. Включён — одна попытка, отказ
+        # не меняет итоговую клавиатуру (destination-строка уже на месте).
+        async def _answer_side() -> None:
+            if answer is None:
+                return
+            if self._try_direct_url_answer and url is not None:
+                if await self._try_answer_url(answer, url, state, task):
+                    return
+            await _answer(answer, "Переход засчитан — нажмите кнопку ещё раз, чтобы открыть бота.")
 
         answer_task = asyncio.ensure_future(_answer_side())
         render_task = asyncio.ensure_future(self._render(state))
-        results = await asyncio.gather(answer_task, render_task, return_exceptions=True)
-        url_answered = results[0] is True
-
-        if url is not None and not url_answered:
-            async with state.lock:
-                state.url_fallback_ids.add(task.task_id)
-            await self._render(state)
+        await asyncio.gather(answer_task, render_task, return_exceptions=True)
 
         self._diag("open.settled", state, task_id=task.task_id,
-                   url_answered=url_answered, fallback=url is not None and not url_answered)
+                   destination_row=url is not None)
 
     async def _try_answer_url(
         self,
@@ -749,6 +763,13 @@ class InteractiveOpBlock:
     def _complete_task(self, state: _BlockState, task: OpTask) -> None:
         state.paid_done_ids.add(task.task_id)
         state.incomplete_ids.discard(task.task_id)
+        if task.action_type == "bot_click":
+            # Верификация bot_click завершена — значит, пользователь уже
+            # запустил бота (presence доказан сервером): доступ получен,
+            # destination-строка больше не нужна и исчезает. Отличие от
+            # bot_tracked_click, где settlement при тапе предшествует
+            # реальному открытию — там строка живёт до expiry.
+            state.destination_ids.discard(task.task_id)
         if not state.incomplete_ids:
             state.completed = True
             state.access_allowed = True
@@ -764,17 +785,26 @@ class InteractiveOpBlock:
 
         if state.completed:
             # Completion: текст «Доступ открыт». В single-message UX
-            # reopen-CTA не существует (целевой бот уже открыт нативно
-            # при тапе) — но fallback URL-строки сохраняются: settlement
-            # подтверждён, а пользователь ещё не попал в бот. Legacy —
-            # reopen-CTA.
+            # destination-строки СОХРАНЯЮТСЯ — completion не уничтожает
+            # последний доступный переход: settlement списал деньги при
+            # тапе, доступ к боту гарантирован до expiry. Legacy — reopen.
             if self._single_message_ux:
-                rows.extend(self._url_fallback_rows(state, ordered))
+                rows.extend(self._destination_rows(state, ordered))
             else:
                 rows.extend(self._reopen_rows(state, ordered))
             return _COMPLETED_TEXT, rows
 
+        destination_rendered: set[int] = set()
         for task in ordered:
+            if self._single_message_ux and task.task_id in state.destination_ids:
+                # Позиционная трансформация: строка остаётся на исходном
+                # месте, превращаясь в прямую URL-кнопку — пользователь
+                # видит изменение того же элемента, а не новый ряд снизу.
+                url = state.destination_url(task)
+                if url is not None:
+                    rows.append([{"text": _clip(task.action_button_text or "Запустить бота"), "url": url}])
+                    destination_rendered.add(task.task_id)
+                continue
             if task.task_id not in state.incomplete_ids:
                 continue
             button = self._task_button(task)
@@ -782,7 +812,9 @@ class InteractiveOpBlock:
                 rows.append([button])
 
         if self._single_message_ux:
-            rows.extend(self._url_fallback_rows(state, ordered))
+            # destination-строки вне ordered (edge: задача ушла из status)
+            # — всё равно не теряем доступ: доотрисовка внизу.
+            rows.extend(self._destination_rows(state, ordered, skip=destination_rendered))
         else:
             rows.extend(self._reopen_rows(state, ordered))
         # UX-контракт v2: кнопки «Проверить выполнение» нет — проверка
@@ -826,22 +858,25 @@ class InteractiveOpBlock:
             }])
         return rows
 
-    def _url_fallback_rows(
-        self, state: _BlockState, ordered: list[OpTask]
+    def _destination_rows(
+        self,
+        state: _BlockState,
+        ordered: list[OpTask],
+        skip: set[int] | None = None,
     ) -> list[list[dict[str, str]]]:
-        """Прямые URL-кнопки В ОСНОВНОМ сообщении для задач, где settlement
-        подтверждён, но answerCallbackQuery(url) не сработал.
+        """Прямые URL-кнопки оплаченных destination в ОСНОВНОМ сообщении.
 
         Это НЕ reopen-строки и НЕ slot-сообщения: кнопка — прямая
-        t.me-ссылка (один тап, нативное открытие), живёт в том же
-        OP-сообщении до completion/expiry. Только для задач, чей
-        url-ответ реально отклонён — в штатном потоке список пуст.
+        t.me-ссылка (нативное открытие), живёт в том же OP-сообщении до
+        expiry. Settlement подтверждён — доступ является финансовым
+        обязательством: sync и completion строку не убирают.
         """
         rows: list[list[dict[str, str]]] = []
+        skip = skip or set()
         for task in ordered:
-            if task.task_id not in state.url_fallback_ids:
+            if task.task_id in skip:
                 continue
-            if task.task_id in state.incomplete_ids:
+            if task.task_id not in state.destination_ids:
                 continue
             url = state.destination_url(task)
             if url is None:
@@ -1088,7 +1123,7 @@ class InteractiveOpBlock:
                     "incomplete_ids": sorted(s.incomplete_ids),
                     "paid_done_ids": sorted(s.paid_done_ids),
                     "server_done_ids": sorted(s.server_done_ids),
-                    "url_fallback_ids": sorted(s.url_fallback_ids),
+                    "destination_ids": sorted(s.destination_ids),
                 }
                 for s in self._states.values()
             ],
@@ -1108,7 +1143,7 @@ class InteractiveOpBlock:
                     incomplete_ids={int(i) for i in block.get("incomplete_ids") or []},
                     paid_done_ids={int(i) for i in block.get("paid_done_ids") or []},
                     server_done_ids={int(i) for i in block.get("server_done_ids") or []},
-                    url_fallback_ids={int(i) for i in block.get("url_fallback_ids") or []},
+                    destination_ids={int(i) for i in block.get("destination_ids") or []},
                     completed=bool(block.get("completed")),
                     # Дампы без флага (первые версии 1.3.2): False —
                     # completion, случившийся в простое бота, будет

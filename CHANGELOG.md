@@ -1,70 +1,71 @@
 # Changelog — Pastuh Ads Partner SDK
 
-## 1.3.4 — Single-message UX + latency: прямое открытие, никаких slot-сообщений
+## 1.3.4 — Single-message UX: positional URL-transform, latency, no artifacts
 
-**Client P0 acceptance fix.** Два класса «артефактов» устранены по контракту
-заказчика: отдельные slot-сообщения («Перейдите по кнопке и нажмите
-Запустить») и reopen-строки («🔁 Запустить бота») в основной клавиатуре.
+**Client P0 acceptance fix.** Оба класса «артефактов» устранены: отдельные
+slot-сообщения («Перейдите по кнопке и нажмите Запустить») и reopen-строки
+(«🔁 Запустить бота») в основной клавиатуре.
 
-### UX-контракт (single_message_ux=True — default)
+### Архитектура UX (single_message_ux=True — default)
 
-- **Прямое открытие бота одним тапом**: после server-side settlement
-  callback отвечается ``answerCallbackQuery(url=t.me/...)`` — клиент
-  пользователя открывает целевой бот нативно, без промежуточных сообщений,
-  браузера и дополнительных обязательных нажатий. ВАЖНО: Bot API
-  документирует url-ответ для ссылок вида t.me/your_bot — поведение для
-  third-party ботов подтверждается real-device QA (см. ниже).
-- **Выполненные кнопки исчезают** — reopen-строки не рендерятся. Один
-  OP = одно сообщение; клавиатура сокращается N→…→1→пустая.
-- **Никаких slot-сообщений** — ``_send_slot`` не вызывается ни на одном
-  пути. Сообщение «Перейдите по кнопке…» больше не существует.
-- **Fallback без slot-сообщений**: если Telegram отклонил url-ответ или
-  answer-callable интеграции не принимает url (TypeError), задача
-  остаётся прямой URL-кнопкой В ТОМ ЖЕ основном сообщении — пользователь
-  не теряет доступ к оплаченному destination ни при каком сбое.
+**Официальное ограничение Telegram**: ``answerCallbackQuery(url)`` принимает
+только deep links к СОБСТВЕННОМУ боту или его игре (core.telegram.org/api/bots/buttons).
+Открытие third-party рекламируемого бота через callback answer невозможно —
+это верифицировано по официальной документации, а не предположение.
+
+Поэтому UX честно **двухтаповый**:
+
+1. Тап по callback-кнопке — server-side settlement (first-click-wins,
+   идемпотентно), toast «Переход засчитан», кнопка **трансформируется на
+   исходной позиции** в прямую t.me URL-кнопку — тот же message, та же строка.
+2. Тап по URL-кнопке — нативное открытие рекламируемого бота без браузера
+   и промежуточных сообщений.
+
+- **Никаких slot-сообщений** — ``_send_slot`` не вызывается ни на одном пути.
+- **Никаких reopen-строк** — не рендерятся нигде.
+- **Destination-строки живут до expiry**: деньги списаны при первом тапе,
+  а бот пользователем ещё не открыт — доступ к оплаченному переходу есть
+  финансовое обязательство. Sync не удаляет строку преждевременно;
+  completion не уничтожает последний доступный переход (last-slot safety —
+  отдельный regression test). Для bot_click строка исчезает после верификации:
+  server-side presence доказывает, что доступ уже получен.
+- ``try_direct_url_answer=True`` — experimental opt-in: одна попытка
+  url-answer (для будущих изменений Telegram или self-referral кейсов);
+  отказ переживается безопасно, клавиатура не зависит от результата.
 
 ### Latency
 
-- Critical path тапа: settlement API → параллельные answer(url)+render.
-  Controlled harness (TG 300ms/API 400ms): 1.0s → 0.7s (−30%, один
-  Telegram RTT убран параллелизмом, второй — удалением slot-отправки).
-- **Piggyback /check больше не блокирует critical path** — выполняется
-  в фоне. Ранее первый тап в 20-секундном окне добавлял полный RTT
-  Partner API к задержке пользователя.
-- Замечание: полная пользовательская задержка включает доставку
-  callback_query и webhook-обработку партнёрской инфраструктуры —
-  измеряется живой приёмкой, а не harness.
+- Critical path тапа: settlement API → параллельные answer-toast + render.
+  Controlled harness (TG 300ms RTT, API 400ms RTT): **1.003s → 0.702s**,
+  sendMessage на тап: 1 → 0. Первый тап в 20-секундном окне: ещё −1 API RTT
+  (piggyback /check переведён в фон). Synthetic результат — реальная
+  пользовательская задержка измеряется живой приёмкой.
+- ``diagnostic_hook``: monotonic T-chain — callback.received →
+  open.api_start/end (charged) → render.start/end → open.settled.
+  Корреляция session/user/message/task; исключения hook изолированы.
 
-### Diagnostic hook
+### Финансовая безопасность
 
-- ``diagnostic_hook`` — опциональный callable ``(dict) -> None``:
-  коррелированные monotonic-события callback.received, open.api_start/end
-  (с charged), answer_url.ok/rejected/unsupported, render.start/end,
-  open.settled. Поля: mono, op_session_id, telegram_user_id, message_id,
-  task_id. Исключения hook изолированы. Boom получает latency breakdown
-  без самостоятельной инструментальности.
-
-### Финансовая безопасность (regression tests)
-
-- Повторный тап по выполненной кнопке — settlement не повторяется
-  (локальный guard + серверная идемпотентность charged=false).
+- ``open_inflight`` guard: одновременные дублирующие тапы — ровно один
+  settlement-запрос (серверная идемпотентность charged=false — последняя линия).
 - Settlement OK + Telegram edit failure — retry восстанавливает UI без
-  повторного settlement (ровано 1 вызов за всю историю сбоя).
-- API failure — задание НЕ завершается, кнопка остаётся, destination
-  не раскрывается без подтверждённого settlement.
+  повторного списания (ровно 1 settlement за всю историю сбоя).
+- API failure — задание не завершается, destination не раскрывается.
+- destination_ids персистятся в dump/restore — перезапуск процесса не
+  отнимает оплаченный переход.
 
 ### Backward compatibility
 
-- ``single_message_ux=False`` — полное поведение 1.3.3 (slot TTL,
+- ``single_message_ux=False`` — полное поведение 1.3.3 (TTL-слоты,
   reopen-CTA) сохранено и покрыто тестами. Дампы состояния читаются.
-- ``answer`` callables старого вида ``async (text)`` продолжают работать —
-  включается URL-fallback вместо прямого открытия. Для полного UX
-  интеграции должны пробрасывать kwargs (см. README).
+- answer-callables старого вида ``async (text)`` работают без изменений.
 
 ### Regression
 
-- 107/107 tests pass: legacy mode + single-message UX + countdown
-  acceptance (4→3→2→1→0, один message_id) + auto_sync + client.
+- **111/111 tests pass**: legacy mode + single-message UX (17 тестов:
+  positional transform, last-slot safety, sync-persistence, restart,
+  concurrent taps, financial idempotency, screenshot-scenario) + countdown
+  acceptance + auto_sync + client.
 
 ## 1.3.3 — UI consistency: no resurrected slots, no orphaned CTAs
 
